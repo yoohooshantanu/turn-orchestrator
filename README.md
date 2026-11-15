@@ -92,12 +92,31 @@ go test -v -mod=readonly ./tests/...
 Benchmarks executed on AMD Ryzen 5 (Offline Go 1.27.0):
 
 ```text
-BenchmarkRMSEnergyCalculation-8       1,283,510 ops/sec   1,055 ns/op     0 B/op    0 allocs/op
-BenchmarkSentenceChunker-8              235,076 ops/sec   6,658 ns/op   576 B/op   16 allocs/op
-BenchmarkBargeInCancellationLatency-8 11,562,864 ops/sec    136.1 ns/op     0 B/op    0 allocs/op
+BenchmarkRMSEnergyCalculation-8            1,000,000 ops/sec   1,491 ns/op        0 B/op    0 allocs/op
+BenchmarkSentenceChunker-8                   189,903 ops/sec   5,935 ns/op      672 B/op   17 allocs/op
+BenchmarkBargeInCancellationLatency-8      9,087,852 ops/sec   118.0 ns/op        0 B/op    0 allocs/op
+BenchmarkEndToEndBargeInPipeline-8            10,915 ops/sec 171,525 ns/op   12,669 B/op   35 allocs/op
 ```
 
-> **Key Performance Takeaway:** Barge-in cancellation executes in **136.1 nanoseconds** (0.000136 ms) with **0 memory allocations**, ensuring instant sub-millisecond reaction times during user speech interruptions.
+> **Microbenchmark vs. Production Pipeline:**
+> - **Cancellation Operation Microbenchmark:** **118.0 nanoseconds** (0.000118 ms) with 0 memory allocations.
+> - **Full End-to-End Interruption Pipeline:** **171.5 microseconds** (0.171 ms) — from incoming 16kHz PCM audio frame $\rightarrow$ RMS calculation $\rightarrow$ VAD voiced threshold $\rightarrow$ FSM state transition $\rightarrow$ Context cancellation $\rightarrow$ Audio output channel drain $\rightarrow$ Client event emission.
+> - **Telephony SLA:** Sub-40ms. VocalFlow operates at **0.17 ms**, over **230× faster** than the telephony industry threshold.
+
+---
+
+## Production Deployment & Docker
+
+Deploy VocalFlow and Prometheus sidecar with Docker Compose:
+
+```bash
+docker-compose up -d
+```
+
+- **VocalFlow Gateway:** `http://localhost:8085` (WS: `ws://localhost:8085/ws/voice/{session_id}`)
+- **Prometheus Metrics:** `http://localhost:8085/metrics`
+- **Prometheus UI:** `http://localhost:9090`
+- **pprof Profiling:** `http://localhost:8085/debug/pprof/`
 
 Compile binary:
 

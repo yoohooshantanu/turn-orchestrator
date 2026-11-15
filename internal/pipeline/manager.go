@@ -67,7 +67,7 @@ func (sm *SessionManager) ActiveCount() int {
 }
 
 func (sm *SessionManager) cleanupLoop() {
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -76,17 +76,11 @@ func (sm *SessionManager) cleanupLoop() {
 			return
 		case <-ticker.C:
 			sm.mu.Lock()
-			// Bound sessions table to 10,000 active sessions
-			if len(sm.sessions) > 10000 {
-				count := 0
-				for id, s := range sm.sessions {
-					if s.IsClosed() {
-						delete(sm.sessions, id)
-						count++
-						if count >= 2000 {
-							break
-						}
-					}
+			for id, s := range sm.sessions {
+				if s.ShouldExpire(60 * time.Second) {
+					s.Close()
+					delete(sm.sessions, id)
+					logger.L.Info("session_expired_and_pruned", "session_id", id)
 				}
 			}
 			sm.mu.Unlock()

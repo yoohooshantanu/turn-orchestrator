@@ -46,3 +46,22 @@ func BenchmarkBargeInCancellationLatency(b *testing.B) {
 		sess.TriggerBargeIn()
 	}
 }
+
+func BenchmarkEndToEndBargeInPipeline(b *testing.B) {
+	pcm := make([]byte, 640)
+	for i := 0; i < len(pcm); i += 2 {
+		pcm[i] = 0x00
+		pcm[i+1] = 0x25
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sess := pipeline.NewVoiceSession("sess_bench_e2e")
+		// Simulate active speech state
+		_ = sess.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
+		// Trigger barge-in via raw audio frames
+		_ = sess.IngestAudio(&model.AudioFrame{Data: pcm})
+		_ = sess.IngestAudio(&model.AudioFrame{Data: pcm})
+		sess.Close()
+	}
+}

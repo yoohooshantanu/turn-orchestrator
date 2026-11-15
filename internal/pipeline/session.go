@@ -35,6 +35,10 @@ type VoiceSession struct {
 	stopCh            chan struct{}
 	stopOnce          sync.Once
 	isClosed          bool
+	isDetached        bool
+	detachedAt        time.Time
+	reconnectCount    int
+	graceWindow       time.Duration
 	eventListeners    []EventListener
 }
 
@@ -52,6 +56,7 @@ func NewVoiceSession(sessionID string) *VoiceSession {
 		audioOut:       make(chan *model.AudioChunk, 512),
 		eventOut:       make(chan *model.TurnEvent, 512),
 		stopCh:         make(chan struct{}),
+		graceWindow:    60 * time.Second,
 		eventListeners: make([]EventListener, 0),
 	}
 
@@ -109,6 +114,56 @@ func (s *VoiceSession) GetActiveTurnMetrics() *model.TurnMetrics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.activeTurnMetrics
+}
+
+// MarkDetached flags the session as disconnected while preserving conversation state during grace window
+func (s *VoiceSession) MarkDetached() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isDetached = true
+	s.detachedAt = time.Now()
+	logger.L.Warn("session_client_detached", "session_id", s.sessionID, "reconnect_window_sec", s.graceWindow.Seconds())
+}
+
+// MarkAttached restores active streaming upon WebSocket client reconnection
+func (s *VoiceSession) MarkAttached() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.isDetached {
+		s.isDetached = false
+		s.detachedAt = time.Time{}
+		s.reconnectCount++
+		logger.L.Info("session_client_reconnected", "session_id", s.sessionID, "reconnect_count", s.reconnectCount)
+	}
+}
+
+// IsDetached returns whether the session is currently awaiting client reconnection
+func (s *VoiceSession) IsDetached() (bool, time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.isDetached {
+		return false, 0
+	}
+	return true, time.Since(s.detachedAt)
+}
+
+// ShouldExpire checks whether a detached session has exceeded the reconnect grace window
+func (s *VoiceSession) ShouldExpire(window time.Duration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.isClosed {
+		return true
+	}
+	if s.isDetached && time.Since(s.detachedAt) > window {
+		return true
+	}
+	return false
+}
+
+func (s *VoiceSession) ReconnectCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reconnectCount
 }
 
 // IngestAudio processes incoming telephony audio frames through VAD
@@ -312,6 +367,16 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		Data:       audioBytes,
 		DurationMs: 400,
 		Timestamp:  time.Now().UnixMilli(),
+	}
+
+	// Bounded output buffer backpressure: if audioOut buffer exceeds 256 chunks (~100s audio),
+	// drop the oldest unconsumed audio packet to prevent stale playback accumulation on lagging clients
+	if len(s.audioOut) >= 256 {
+		select {
+		case <-s.audioOut:
+			logger.L.Warn("audio_buffer_high_watermark_dropped_oldest", "session_id", s.sessionID)
+		default:
+		}
 	}
 
 	select {

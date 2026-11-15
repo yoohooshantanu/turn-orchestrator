@@ -358,3 +358,134 @@ ReceiveLoop:
 		}
 	}
 }
+
+func TestEndToEndBargeInPipelineLatency(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_e2e_bargein")
+	defer session.Close()
+
+	// 1. Advance session to SPEAKING state
+	for i := 0; i < 3; i++ {
+		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
+	}
+	time.Sleep(360 * time.Millisecond)
+	_ = session.IngestAudio(&model.AudioFrame{Energy: 0.001, IsVoiced: false})
+
+	tokens := make(chan string, 5)
+	tokens <- "Your appointment is confirmed for "
+	tokens <- "tomorrow afternoon at 2 PM. Please let us know if you need to reschedule."
+	close(tokens)
+	session.StartLLMResponseStream(tokens)
+
+	// Wait for audio synthesis
+	select {
+	case <-session.AudioOut():
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for audio chunk")
+	}
+
+	if session.State() != model.StateSpeaking {
+		t.Fatalf("expected state SPEAKING, got %s", session.State())
+	}
+
+	// 2. Synthesize raw 16-bit linear PCM audio frame (20ms @ 16kHz = 640 bytes)
+	pcm := make([]byte, 640)
+	for i := 0; i < len(pcm); i += 2 {
+		pcm[i] = 0x00
+		pcm[i+1] = 0x25 // Generates RMS energy ~0.07 > 0.02 threshold
+	}
+
+	// 3. Measure complete end-to-end barge-in latency from caller speech frame arrival
+	// through RMS -> VAD -> FSM Interruption -> Context Cancel -> Audio Buffer Drain -> Event Emission
+	t0 := time.Now()
+
+	// First voiced frame increments consecutive counter
+	_ = session.IngestAudio(&model.AudioFrame{Data: pcm})
+	// Second voiced frame triggers Barge-In
+	_ = session.IngestAudio(&model.AudioFrame{Data: pcm})
+
+	// Wait for barge-in event confirmation
+	var bargeInEvt *model.TurnEvent
+	timeout := time.After(500 * time.Millisecond)
+EventLoop:
+	for {
+		select {
+		case evt := <-session.EventOut():
+			if evt.Type == model.EventBargeInTriggered {
+				bargeInEvt = evt
+				break EventLoop
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for barge in event")
+		}
+	}
+
+	totalDuration := time.Since(t0)
+
+	t.Logf(">>> VERIFIED END-TO-END BARGE-IN PIPELINE LATENCY: %v (Telephony SLA < 40ms)", totalDuration)
+
+	if totalDuration > 40*time.Millisecond {
+		t.Errorf("end-to-end barge-in exceeded 40ms SLA: took %v", totalDuration)
+	}
+
+	if session.State() != model.StateListening {
+		t.Errorf("expected state LISTENING, got %s", session.State())
+	}
+
+	if bargeInEvt == nil {
+		t.Errorf("expected EventBargeInTriggered event")
+	}
+
+	// Verify audio output queue was completely drained
+	select {
+	case leftover := <-session.AudioOut():
+		t.Errorf("audio queue was not drained: found chunk %v", leftover)
+	default:
+		// Queue cleanly empty
+	}
+}
+
+func TestWebSocketSessionReconnectRecovery(t *testing.T) {
+	mgr := pipeline.NewSessionManager(5 * time.Minute)
+	defer mgr.Stop()
+
+	sessionID := "sess_reconnect_test_123"
+	sess := mgr.GetOrCreate(sessionID)
+
+	// Ingest audio
+	_ = sess.IngestAudio(&model.AudioFrame{Energy: 0.06, IsVoiced: true})
+
+	// 1. Simulate mobile network drop: client disconnects
+	sess.MarkDetached()
+
+	isDetached, dur := sess.IsDetached()
+	if !isDetached {
+		t.Errorf("expected session to be marked detached")
+	}
+	if dur > 1*time.Second {
+		t.Errorf("expected detachment duration near 0, got %v", dur)
+	}
+
+	// Session must still be available in manager for reconnection
+	savedSess, ok := mgr.Get(sessionID)
+	if !ok || savedSess == nil {
+		t.Fatalf("expected session to be preserved in manager during grace window")
+	}
+
+	// 2. Client reconnects within grace window
+	reconnectedSess := mgr.GetOrCreate(sessionID)
+	reconnectedSess.MarkAttached()
+
+	if reconnectedSess.ReconnectCount() != 1 {
+		t.Errorf("expected reconnect count 1, got %d", reconnectedSess.ReconnectCount())
+	}
+
+	detachedNow, _ := reconnectedSess.IsDetached()
+	if detachedNow {
+		t.Errorf("expected session to be active, not detached")
+	}
+
+	// Conversation state must be seamlessly preserved
+	if reconnectedSess.State() != sess.State() {
+		t.Errorf("expected state %s, got %s", sess.State(), reconnectedSess.State())
+	}
+}

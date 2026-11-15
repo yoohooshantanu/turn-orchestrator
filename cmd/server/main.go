@@ -80,7 +80,10 @@ func main() {
 		defer conn.Close()
 
 		session := mgr.GetOrCreate(sessionID)
-		defer mgr.Delete(sessionID)
+		session.MarkAttached()
+
+		// On disconnect, mark detached with 60s grace period for reconnect recovery
+		defer session.MarkDetached()
 
 		clientCtx, clientCancel := context.WithCancel(r.Context())
 		defer clientCancel()
@@ -133,6 +136,10 @@ func main() {
 
 			case "playback_finished":
 				session.FinishPlayback()
+
+			case "call_ended", "session_close":
+				mgr.Delete(sessionID)
+				return
 			}
 		}
 	})
