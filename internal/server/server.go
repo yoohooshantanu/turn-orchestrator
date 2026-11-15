@@ -19,13 +19,22 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/vad"
 )
 
-// checkAuth enforces Bearer token authentication when AUTH_TOKEN is configured.
-// Origin validation (RFC 6454) protects against Cross-Site WebSocket Hijacking (CSWSH) from browsers,
-// while checkAuth authenticates client identity.
+// checkAuth enforces fail-closed Bearer token authentication.
+// Query-string tokens are explicitly rejected to prevent token leakage in proxy logs and browser histories.
+// In production (ENV=production or REQUIRE_AUTH=true), missing AUTH_TOKEN configuration fails closed.
 func checkAuth(r *http.Request) bool {
+	isProd := os.Getenv("ENV") == "production" || os.Getenv("VOCALFLOW_ENV") == "production" || os.Getenv("REQUIRE_AUTH") == "true"
 	expectedToken := os.Getenv("AUTH_TOKEN")
+
+	// Fail-closed security guard: in production or when auth is required, an unset AUTH_TOKEN denies all access
+	if isProd && expectedToken == "" {
+		logger.L.Error("auth_failed_closed_missing_auth_token_config")
+		return false
+	}
+
+	// Local development mode: allow unauthenticated traffic only if explicitly unconfigured and not in production
 	if expectedToken == "" {
-		return true // Auth disabled for open development mode
+		return true
 	}
 
 	authHeader := r.Header.Get("Authorization")
@@ -36,12 +45,7 @@ func checkAuth(r *http.Request) bool {
 		}
 	}
 
-	if qToken := r.URL.Query().Get("token"); qToken != "" {
-		if subtle.ConstantTimeCompare([]byte(qToken), []byte(expectedToken)) == 1 {
-			return true
-		}
-	}
-
+	// Query-string tokens (?token=...) are strictly rejected to prevent credential leaks into logs
 	return false
 }
 

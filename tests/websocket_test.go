@@ -172,16 +172,39 @@ func TestWebSocketAuthentication(t *testing.T) {
 	}
 	_ = connBearer.Close()
 
-	// 3. Connection with URL query token -> Accepted (101)
+	// 3. Query string token (?token=...) MUST BE REJECTED (prevent credential leaks into logs)
 	wsURLQuery := wsURL + "?token=vocalflow_secret_token_99"
-	connQuery, respQuery, err := websocket.DefaultDialer.Dial(wsURLQuery, nil)
-	if err != nil {
-		t.Fatalf("expected valid query token to connect, got: %v", err)
+	_, respQuery, err := websocket.DefaultDialer.Dial(wsURLQuery, nil)
+	if err == nil {
+		t.Fatalf("query-string token must be rejected with 401")
 	}
-	if respQuery.StatusCode != http.StatusSwitchingProtocols {
-		t.Errorf("expected 101, got %d", respQuery.StatusCode)
+	if respQuery != nil && respQuery.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for query-string token, got %d", respQuery.StatusCode)
 	}
-	_ = connQuery.Close()
+}
+
+func TestWebSocketFailClosedSecurity(t *testing.T) {
+	// In production or when REQUIRE_AUTH is true, missing AUTH_TOKEN configuration MUST FAIL CLOSED
+	os.Setenv("REQUIRE_AUTH", "true")
+	os.Unsetenv("AUTH_TOKEN")
+	defer os.Unsetenv("REQUIRE_AUTH")
+
+	mgr := pipeline.NewSessionManager(5 * time.Minute)
+	defer mgr.Stop()
+
+	handler := server.NewServerHandler(mgr)
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/voice/sess_fail_closed"
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatalf("expected fail-closed mode to reject connections when AUTH_TOKEN is unset")
+	}
+	if resp != nil && resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized in fail-closed mode, got %d", resp.StatusCode)
+	}
 }
 
 func TestWebSocketFullDuplexLiveAudio(t *testing.T) {

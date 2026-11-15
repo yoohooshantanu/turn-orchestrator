@@ -72,6 +72,7 @@ type VoiceSession struct {
 	graceWindow       time.Duration
 	eventListeners    []EventListener
 	synthesisBarrierHook func(turnGen uint64)
+	ttsProvider          StreamingTTSProvider
 }
 
 func NewVoiceSession(sessionID string) *VoiceSession {
@@ -90,6 +91,7 @@ func NewVoiceSession(sessionID string) *VoiceSession {
 		stopCh:         make(chan struct{}),
 		graceWindow:    60 * time.Second,
 		eventListeners: make([]EventListener, 0),
+		ttsProvider:    NewFormantTestHarnessTTS(),
 	}
 
 	vadCallbacks := vad.VADCallbacks{
@@ -206,6 +208,14 @@ func (s *VoiceSession) ReconnectCount() int {
 
 // SetSynthesisBarrierHook registers an optional concurrency barrier hook invoked directly
 // prior to guarded audio queue admission. Used for deterministic mathematical race testing.
+
+// SetTTSProvider configures a streaming text-to-speech synthesis engine (test harness or cloud adapter)
+func (s *VoiceSession) SetTTSProvider(provider StreamingTTSProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ttsProvider = provider
+}
+
 func (s *VoiceSession) SetSynthesisBarrierHook(hook func(turnGen uint64)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -454,8 +464,11 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		_ = s.fsm.Transition(model.StateSpeaking)
 	}
 
-	// Real 16kHz 16-bit linear PCM speech waveform (640 bytes = 20ms of audio with F0/F1/F2 formants)
-	audioBytes := GenerateFormantAudioPCM(chunk.Index * 320)
+	// Stream PCM audio chunk from configured TTS provider (defaults to acoustic formant test harness)
+	audioBytes, err := s.ttsProvider.SynthesizeChunk(ctx, chunk.Text, chunk.Index)
+	if err != nil || len(audioBytes) == 0 {
+		return
+	}
 
 	audioChunk := &model.AudioChunk{
 		SessionID:  s.sessionID,
