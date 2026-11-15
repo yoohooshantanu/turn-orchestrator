@@ -146,8 +146,16 @@ func (c *SentenceChunker) emitChunk(text string, isFinal bool) {
 func findSentenceBoundary(s string) int {
 	for i, r := range s {
 		if r == '.' || r == '!' || r == '?' || r == '\n' {
-			// Ensure it's not a common decimal number or abbreviation (e.g. "3.14" or "Dr.")
+			// 1. Skip ellipsis: if followed by another dot, do not split
+			if r == '.' && i+1 < len(s) && s[i+1] == '.' {
+				continue
+			}
+			// 2. Ensure it's not a common decimal number (e.g. "3.14")
 			if i+1 < len(s) && unicode.IsDigit(rune(s[i+1])) {
+				continue
+			}
+			// 3. Skip common honorific abbreviations (e.g. "Dr.", "Mr.", "Mrs.")
+			if r == '.' && isAbbreviation(s[:i]) {
 				continue
 			}
 			return i
@@ -156,8 +164,25 @@ func findSentenceBoundary(s string) int {
 	return -1
 }
 
+func isAbbreviation(prefix string) bool {
+	fields := strings.Fields(prefix)
+	if len(fields) == 0 {
+		return false
+	}
+	lastWord := strings.ToLower(fields[len(fields)-1])
+	switch lastWord {
+	case "mr", "mrs", "ms", "dr", "prof", "vs", "etc", "e.g", "i.e":
+		return true
+	}
+	return false
+}
+
 func findClauseBoundary(s string) int {
 	for i, r := range s {
+		// Skip comma within numeric formatting (e.g. "$10,000")
+		if r == ',' && i > 0 && i+1 < len(s) && unicode.IsDigit(rune(s[i-1])) && unicode.IsDigit(rune(s[i+1])) {
+			continue
+		}
 		if r == ',' || r == ';' || r == ':' || r == '—' {
 			return i
 		}

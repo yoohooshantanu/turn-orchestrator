@@ -283,3 +283,78 @@ func TestVADAudioStreamBargeInDeadlockFree(t *testing.T) {
 		t.Errorf("expected state LISTENING after audio barge-in, got %s", session.State())
 	}
 }
+
+func TestSentenceChunkerAbbreviationAndEllipsis(t *testing.T) {
+	var chunks []*model.SentenceChunk
+	var mu sync.Mutex
+
+	sc := chunker.NewSentenceChunker("sess_abbrev", "turn_1", func(chunk *model.SentenceChunk) {
+		mu.Lock()
+		defer mu.Unlock()
+		chunks = append(chunks, chunk)
+	})
+
+	// Stream text containing honorific abbreviation "Dr." and currency with comma "$5,000"
+	tokens := []string{"Hello, ", "please ", "meet ", "Dr. ", "Smith ", "at ", "the ", "clinic. ", "The total cost is $5,000 in cash."}
+	for _, tok := range tokens {
+		sc.IngestToken(tok)
+	}
+	sc.Flush()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// It should NOT have split on "Dr." or "$5,000"
+	for _, c := range chunks {
+		if c.Text == "Dr." || c.Text == "please meet Dr." {
+			t.Errorf("unexpected split at honorific abbreviation: %s", c.Text)
+		}
+		if c.Text == "$5" || c.Text == "000 in cash." {
+			t.Errorf("unexpected split on currency comma: %s", c.Text)
+		}
+	}
+}
+
+func TestStrictAudioChunkSequentialOrdering(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_seq_order")
+	defer session.Close()
+
+	// Simulate turn
+	for i := 0; i < 3; i++ {
+		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
+	}
+	time.Sleep(360 * time.Millisecond)
+	_ = session.IngestAudio(&model.AudioFrame{Energy: 0.001, IsVoiced: false})
+
+	tokenCh := make(chan string, 10)
+	tokenCh <- "First sentence is short. "
+	tokenCh <- "Second sentence is slightly longer with more details. "
+	tokenCh <- "Third sentence concludes the message completely."
+	close(tokenCh)
+
+	session.StartLLMResponseStream(tokenCh)
+
+	var receivedIndices []int
+	timeout := time.After(2 * time.Second)
+
+ReceiveLoop:
+	for len(receivedIndices) < 3 {
+		select {
+		case chunk := <-session.AudioOut():
+			receivedIndices = append(receivedIndices, chunk.ChunkIdx)
+		case <-timeout:
+			break ReceiveLoop
+		}
+	}
+
+	if len(receivedIndices) < 2 {
+		t.Fatalf("expected at least 2 chunks, got %d", len(receivedIndices))
+	}
+
+	// Verify monotonic index ordering: [0, 1, 2...]
+	for i := 1; i < len(receivedIndices); i++ {
+		if receivedIndices[i] <= receivedIndices[i-1] {
+			t.Errorf("out-of-order audio chunk detected: received %v", receivedIndices)
+		}
+	}
+}

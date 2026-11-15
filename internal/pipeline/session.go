@@ -186,11 +186,33 @@ func (s *VoiceSession) StartLLMResponseStream(tokenStream <-chan string) {
 		return
 	}
 
+	// Sequential synthesis pipeline: guarantees strict in-order audio emission to telephony output
+	sentenceCh := make(chan *model.SentenceChunk, 64)
+
+	go func() {
+		for {
+			select {
+			case <-turnCtx.Done():
+				return
+			case chunk, ok := <-sentenceCh:
+				if !ok {
+					return
+				}
+				s.synthesizeAndStream(turnCtx, chunk)
+			}
+		}
+	}()
+
 	chunkerEngine := chunker.NewSentenceChunker(s.sessionID, turnID, func(chunk *model.SentenceChunk) {
 		s.handleSentenceReady(turnCtx, chunk)
+		select {
+		case <-turnCtx.Done():
+		case sentenceCh <- chunk:
+		}
 	})
 
 	go func() {
+		defer close(sentenceCh)
 		defer chunkerEngine.Flush()
 
 		firstTokenRecorded := false
@@ -239,9 +261,6 @@ func (s *VoiceSession) handleSentenceReady(ctx context.Context, chunk *model.Sen
 		Payload:   chunk.Text,
 		Timestamp: time.Now().UnixMilli(),
 	})
-
-	// Synthesize audio frame from sentence chunk
-	go s.synthesizeAndStream(ctx, chunk)
 }
 
 func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.SentenceChunk) {

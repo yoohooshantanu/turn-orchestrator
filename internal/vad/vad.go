@@ -103,7 +103,10 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 	isVoiced := energy >= v.cfg.EnergyThreshold
 	frame.IsVoiced = isVoiced
 
-	currState := v.fsm.Current()
+	var currState model.ConversationState = model.StateListening
+	if v.fsm != nil {
+		currState = v.fsm.Current()
+	}
 
 	// 1. Barge-In Interruption Detection:
 	// Caller speaks while AI is Thinking, Speaking, or Draining
@@ -147,6 +150,9 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 			if silenceDuration >= v.cfg.SilenceHangover {
 				v.isSpeaking = false
 				turnDuration := v.lastVoicedTime.Sub(v.speechStartTime)
+				if turnDuration < 0 {
+					turnDuration = 0
+				}
 
 				logger.L.Info("user_speech_ended",
 					"session_id", v.sessionID,
