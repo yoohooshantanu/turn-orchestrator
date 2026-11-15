@@ -71,6 +71,7 @@ type VoiceSession struct {
 	reconnectCount    int
 	graceWindow       time.Duration
 	eventListeners    []EventListener
+	synthesisBarrierHook func(turnGen uint64)
 }
 
 func NewVoiceSession(sessionID string) *VoiceSession {
@@ -202,6 +203,15 @@ func (s *VoiceSession) ReconnectCount() int {
 }
 
 // IngestAudio processes incoming telephony audio frames through VAD
+
+// SetSynthesisBarrierHook registers an optional concurrency barrier hook invoked directly
+// prior to guarded audio queue admission. Used for deterministic mathematical race testing.
+func (s *VoiceSession) SetSynthesisBarrierHook(hook func(turnGen uint64)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.synthesisBarrierHook = hook
+}
+
 func (s *VoiceSession) IngestAudio(frame *model.AudioFrame) error {
 	s.mu.RLock()
 	if s.isClosed {
@@ -454,6 +464,13 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		Data:       audioBytes,
 		DurationMs: 20,
 		Timestamp:  time.Now().UnixMilli(),
+	}
+
+	s.mu.RLock()
+	hook := s.synthesisBarrierHook
+	s.mu.RUnlock()
+	if hook != nil {
+		hook(turnGen)
 	}
 
 	// Guarded enqueue to guarantee no stale chunk from an interrupted turn ever enters audioOut

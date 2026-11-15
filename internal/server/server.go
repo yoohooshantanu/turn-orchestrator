@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"net/http/pprof"
@@ -17,6 +18,32 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
 	"github.com/yoohooshantanu/vocalflow/internal/vad"
 )
+
+// checkAuth enforces Bearer token authentication when AUTH_TOKEN is configured.
+// Origin validation (RFC 6454) protects against Cross-Site WebSocket Hijacking (CSWSH) from browsers,
+// while checkAuth authenticates client identity.
+func checkAuth(r *http.Request) bool {
+	expectedToken := os.Getenv("AUTH_TOKEN")
+	if expectedToken == "" {
+		return true // Auth disabled for open development mode
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) == 1 {
+			return true
+		}
+	}
+
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
+		if subtle.ConstantTimeCompare([]byte(qToken), []byte(expectedToken)) == 1 {
+			return true
+		}
+	}
+
+	return false
+}
 
 // MakeUpgrader builds a WebSocket upgrader with production-grade origin validation
 func MakeUpgrader() websocket.Upgrader {
@@ -68,6 +95,11 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 			return
 		}
 
+		if !checkAuth(r) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+
 		var req struct {
 			SessionID string `json:"session_id"`
 		}
@@ -90,6 +122,11 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 			return
 		}
 		sessionID := parts[2]
+
+		if !checkAuth(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
