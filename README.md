@@ -4,7 +4,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yoohooshantanu/vocalflow)](https://goreportcard.com/report/github.com/yoohooshantanu/vocalflow)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**VocalFlow** is a low-latency, full-duplex conversational turn orchestration engine written in Go. Designed for mission-critical AI voice agents (telephony and WebRTC), VocalFlow solves the two hardest real-time voice challenges: **sub-250ms Time-to-First-Audio (TTFA)** and **sub-40ms atomic barge-in interruption cancellation** with **turn-generation race elimination**, **binary PCM audio streaming**, and **in-memory session reconnect recovery**.
+**VocalFlow** is a low-latency, full-duplex conversational turn orchestration engine written in Go. Designed for mission-critical AI voice agents (telephony and WebRTC), VocalFlow solves the two hardest real-time voice challenges: **sub-250ms Time-to-First-Audio (TTFA)** and **sub-millisecond atomic barge-in interruption cancellation** with **turn-generation race elimination**, **binary PCM audio streaming**, and **in-memory session reconnect recovery**.
 
 ---
 
@@ -57,20 +57,37 @@
    - Streams synthesized binary PCM audio chunks directly to client audio players.
 2. **Turn Generation Race Protection**:
    - Atomic turn generation counters (`turnGen`) invalidate in-flight synthesis tasks when barge-in occurs.
-   - Guarantees that stale audio chunks from an interrupted turn cannot re-enter the output queue post-cancellation.
-3. **Streaming Clause-Boundary Sentence Chunker**:
+   - Guarantees that stale audio chunks from an interrupted turn cannot re-enter the output queue post-cancellation. Verified using deterministic Go channel synchronization barriers (`TestDeterministicStaleAudioBarrier`).
+3. **Fail-Closed Security & Origin Validation**:
+   - RFC 6454 `CheckOrigin` protects against Cross-Site WebSocket Hijacking (CSWSH).
+   - Constant-time comparison (`subtle.ConstantTimeCompare`) on HTTP `Authorization: Bearer <token>` authenticates client identity.
+   - Query string tokens (`?token=...`) are explicitly rejected to prevent token leakage in proxy logs and browser histories.
+   - In production (`REQUIRE_AUTH=true`), unset token configuration fails closed (`TestWebSocketFailClosedSecurity`).
+4. **Streaming Clause-Boundary Sentence Chunker**:
    - Rather than waiting for complete LLM responses (which incurs 2-3s delays), VocalFlow chunks streaming tokens at clause boundaries (`,`, `;`, `:`) after 3–5 words for the first chunk, kicking off neural TTS synthesis in parallel.
    - Handles honorific abbreviations (`Dr.`, `Mr.`, `Ms.`, `Prof.`, `vs.`, `etc.`), currency amounts (`$10,000`), and ellipses (`...`).
-4. **Sub-Millisecond Atomic Barge-In Interruption**:
+5. **Sub-Millisecond In-Process Interruption Scheduling**:
    - When a caller speaks while the AI is thinking or speaking, VocalFlow cancels the active `context.Context`, dumps pending audio playback packets, and emits a `BARGE_IN_TRIGGERED` control event to immediately clear client speaker buffers.
-5. **Turn-Taking Finite State Machine (FSM)**:
+6. **Turn-Taking Finite State Machine (FSM)**:
    - Governs conversational states: `IDLE` $\rightarrow$ `LISTENING` $\rightarrow$ `THINKING` $\rightarrow$ `SPEAKING` $\rightarrow$ `DRAINING` $\rightarrow$ `INTERRUPTED`.
    - Thread-safe state transition validation protects against race conditions during rapid turn-taking.
-6. **Session Reconnect & Recovery Grace Period**:
+7. **Session Reconnect & Recovery Grace Period**:
    - Telephony client disconnects mark the session detached with a 60-second recovery grace window (`ShouldExpire`).
    - Reconnecting with the same `session_id` reattaches the audio queue without losing dialogue history.
-7. **Real-Time Telemetry & Prometheus Sidecar**:
+8. **Real-Time Telemetry & Prometheus Sidecar**:
    - Prometheus metrics tracking Time-to-First-Audio (TTFA), Time-to-First-Token (TTFT), sub-millisecond barge-in reaction latency (`vocalflow_avg_barge_in_reaction_ms`), active sessions, and sentences synthesized.
+
+---
+
+## Audio Synthesis & Streaming TTS Architecture
+
+VocalFlow decouples turn orchestration from external cloud speech providers via the `StreamingTTSProvider` interface:
+
+1. **Acoustic Test Harness Waveform Synthesizer (`FormantTestHarnessTTS`)**:
+   - Generates a synthetic 16kHz 16-bit linear PCM acoustic test waveform ($F_0=150\text{Hz}, F_1=500\text{Hz}, F_2=1500\text{Hz}$) with measurable RMS acoustic energy.
+   - Provides deterministic, offline verification of audio buffering, VAD, and barge-in scheduling without cloud API keys, network jitter, or third-party usage costs.
+2. **Production Cloud TTS Adapters (`StreamingTTSProvider`)**:
+   - Pluggable streaming synthesis interface (`CartesiaStreamingTTS` / `ElevenLabsStreamingTTS`) for cloud WebSocket streaming neural speech synthesis.
 
 ---
 
@@ -106,10 +123,10 @@ BenchmarkBargeInCancellationLatency-8         10,000 ops/sec  188,442 ns/op   16
 BenchmarkEndToEndBargeInPipeline-8             2,323 ops/sec  431,558 ns/op   16,892 B/op   68 allocs/op
 ```
 
-> **Performance Analysis:**
-> - **Active Barge-In Cancellation Benchmark:** **188.4 microseconds** (0.188 ms) — *Measures context cancellation, turn-generation invalidation, queue draining of 5 buffered audio packets, and FSM transition from `SPEAKING` $\rightarrow$ `INTERRUPTED` $\rightarrow$ `LISTENING`.*
-> - **Full End-to-End Interruption Pipeline:** **431.5 microseconds** (0.431 ms) — *Measures the complete chain from incoming raw 16kHz PCM audio bytes $\rightarrow$ RMS calculation $\rightarrow$ VAD voiced threshold detection $\rightarrow$ Barge-in callback $\rightarrow$ Context cancellation $\rightarrow$ Audio buffer drain $\rightarrow$ FSM transition $\rightarrow$ WebSocket event emission.*
-> - **Telephony SLA:** Sub-40ms. VocalFlow operates at **0.43 ms**, over **90× faster** than the telephony industry threshold.
+> **Latency Budget & SLA Context:**
+> - **In-Process Cancellation Benchmark:** **188.4 microseconds** (0.188 ms) — *Measures context cancellation, atomic turn-generation invalidation, queue draining of 5 buffered audio packets, and FSM transition from `SPEAKING` $\rightarrow$ `INTERRUPTED` $\rightarrow$ `LISTENING`.*
+> - **Full End-to-End Interruption Pipeline:** **431.5 microseconds** (0.431 ms) — *Measures the complete internal chain from incoming raw 16kHz PCM audio bytes $\rightarrow$ RMS calculation $\rightarrow$ VAD voiced threshold detection $\rightarrow$ Barge-in callback $\rightarrow$ Context cancellation $\rightarrow$ Audio buffer drain $\rightarrow$ FSM transition $\rightarrow$ WebSocket event emission.*
+> - **Telephony SLA Budget:** In telephony voice agents, human conversational perception expects barge-in interruption within **40 milliseconds**. VocalFlow's internal engine scheduling, cancellation, and buffer drain completes in **0.43 ms (431 µs)**. This sub-millisecond in-process execution leaves over **39.5 ms of latency headroom** for network transit, PSTN/SIP carrier packetization, and client audio player buffer flushes.
 
 ---
 

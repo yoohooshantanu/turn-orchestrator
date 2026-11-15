@@ -464,8 +464,15 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		_ = s.fsm.Transition(model.StateSpeaking)
 	}
 
-	// Stream PCM audio chunk from configured TTS provider (defaults to acoustic formant test harness)
-	audioBytes, err := s.ttsProvider.SynthesizeChunk(ctx, chunk.Text, chunk.Index)
+	// Thread-safe read of configured TTS provider under mutex read lock
+	s.mu.RLock()
+	tts := s.ttsProvider
+	s.mu.RUnlock()
+	if tts == nil {
+		return
+	}
+
+	audioBytes, err := tts.SynthesizeChunk(ctx, chunk.Text, chunk.Index)
 	if err != nil || len(audioBytes) == 0 {
 		return
 	}
@@ -617,7 +624,7 @@ func (s *VoiceSession) emitEvent(evt *model.TurnEvent) {
 	}
 }
 
-// Close gracefully stops the voice session and releases channels
+// Close gracefully stops the voice session, closes the TTS provider, and releases channels
 func (s *VoiceSession) Close() {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
@@ -625,7 +632,12 @@ func (s *VoiceSession) Close() {
 		if s.activeTurnCancel != nil {
 			s.activeTurnCancel()
 		}
+		tts := s.ttsProvider
 		s.mu.Unlock()
+
+		if tts != nil {
+			_ = tts.Close()
+		}
 
 		_ = s.fsm.Transition(model.StateIdle)
 		close(s.stopCh)
