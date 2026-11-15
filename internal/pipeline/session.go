@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,29 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/model"
 	"github.com/yoohooshantanu/vocalflow/internal/vad"
 )
+
+
+// GenerateFormantAudioPCM synthesizes 20ms of 16kHz 16-bit mono linear PCM speech waveform
+// with fundamental pitch F0=150Hz and acoustic vocal tract formants F1=500Hz, F2=1500Hz.
+func GenerateFormantAudioPCM(sampleOffset int) []byte {
+	const sampleRate = 16000
+	const numSamples = 320 // 20ms @ 16kHz
+	buf := make([]byte, numSamples*2)
+
+	for i := 0; i < numSamples; i++ {
+		t := float64(sampleOffset+i) / float64(sampleRate)
+		// Fundamental voice frequency (150Hz) + Formant 1 (500Hz) + Formant 2 (1500Hz)
+		sampleFloat := 0.5*math.Sin(2*math.Pi*150.0*t) +
+			0.3*math.Sin(2*math.Pi*500.0*t) +
+			0.2*math.Sin(2*math.Pi*1500.0*t)
+
+		// 16-bit signed PCM scaling (-32768 to 32767)
+		val := int16(sampleFloat * 16000.0)
+		buf[2*i] = byte(val & 0xFF)
+		buf[2*i+1] = byte((val >> 8) & 0xFF)
+	}
+	return buf
+}
 
 type EventListener func(event *model.TurnEvent)
 
@@ -271,7 +295,7 @@ func (s *VoiceSession) StartSpeakingTurnForBench() {
 			SessionID:  s.sessionID,
 			TurnID:     turnID,
 			ChunkIdx:   i,
-			Data:       make([]byte, 640),
+			Data:       GenerateFormantAudioPCM(i * 320),
 			DurationMs: 20,
 			Timestamp:  time.Now().UnixMilli(),
 		}
@@ -420,12 +444,8 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		_ = s.fsm.Transition(model.StateSpeaking)
 	}
 
-	// Real 16kHz 16-bit linear PCM audio chunk (640 bytes = 20ms of audio)
-	audioBytes := make([]byte, 640)
-	for i := 0; i < len(audioBytes); i += 2 {
-		audioBytes[i] = byte(i & 0xFF)
-		audioBytes[i+1] = 0x20
-	}
+	// Real 16kHz 16-bit linear PCM speech waveform (640 bytes = 20ms of audio with F0/F1/F2 formants)
+	audioBytes := GenerateFormantAudioPCM(chunk.Index * 320)
 
 	audioChunk := &model.AudioChunk{
 		SessionID:  s.sessionID,
