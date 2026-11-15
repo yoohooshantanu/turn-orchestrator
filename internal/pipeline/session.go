@@ -402,7 +402,9 @@ func (s *VoiceSession) recordFirstToken() {
 	if s.activeTurnMetrics != nil && s.activeTurnMetrics.FirstTokenAt.IsZero() {
 		now := time.Now()
 		s.activeTurnMetrics.FirstTokenAt = now
-		s.activeTurnMetrics.TTFT = now.Sub(s.activeTurnMetrics.UserSilenceDetectedAt)
+		if !s.activeTurnMetrics.UserSilenceDetectedAt.IsZero() {
+			s.activeTurnMetrics.TTFT = now.Sub(s.activeTurnMetrics.UserSilenceDetectedAt)
+		}
 	}
 }
 
@@ -435,85 +437,99 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		return
 	}
 
-	// Synthesize real audio bytes from TTS provider (incorporating genuine synthesis and network latency)
-	audioBytes, err := tts.SynthesizeChunk(ctx, chunk.Text, chunk.Index)
-	if err != nil || len(audioBytes) == 0 {
-		return
-	}
+	frameIdx := 0
 
-	// Guard against stale turn generation or barge-in interruption while synthesis was in flight
-	if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
-		return
-	}
-
-	// Record accurate Time-to-First-Audio (TTFA) upon arrival of actual synthesized audio bytes
-	s.mu.Lock()
-	if s.activeTurnMetrics != nil && s.activeTurnMetrics.FirstAudioReadyAt.IsZero() {
-		now := time.Now()
-		s.activeTurnMetrics.FirstAudioReadyAt = now
-		ttfa := now.Sub(s.activeTurnMetrics.UserSilenceDetectedAt)
-		s.activeTurnMetrics.TTFA = ttfa
-		metrics.DefaultMetrics.RecordTTFA(ttfa)
-
-		logger.L.Info("time_to_first_audio_recorded",
-			"session_id", s.sessionID,
-			"turn_id", chunk.TurnID,
-			"ttfa_ms", ttfa.Milliseconds(),
-		)
-	}
-	s.mu.Unlock()
-
-	// Advance FSM to Speaking state upon genuine audio arrival
-	if s.fsm.Is(model.StateThinking) {
-		_ = s.fsm.Transition(model.StateSpeaking)
-	}
-
-	audioChunk := &model.AudioChunk{
-		SessionID:  s.sessionID,
-		TurnID:     chunk.TurnID,
-		ChunkIdx:   chunk.Index,
-		Data:       audioBytes,
-		DurationMs: 20,
-		Timestamp:  time.Now().UnixMilli(),
-	}
-
-	s.mu.RLock()
-	hook := s.synthesisBarrierHook
-	s.mu.RUnlock()
-	if hook != nil {
-		hook(turnGen)
-	}
-
-	// Guarded enqueue to guarantee no stale chunk from an interrupted turn ever enters audioOut
-	s.mu.Lock()
-	if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
-		s.mu.Unlock()
-		return
-	}
-
-	// High watermark backpressure: drop oldest unconsumed packet if buffer exceeds 256 chunks
-	if len(s.audioOut) >= 256 {
-		select {
-		case <-s.audioOut:
-			logger.L.Warn("audio_buffer_high_watermark_dropped_oldest", "session_id", s.sessionID)
-		default:
+	// Stream audio incrementally frame-by-frame as received from TTS provider
+	err := tts.SynthesizeStream(ctx, chunk.Text, chunk.Index, func(pcmFrame []byte) error {
+		// Guard against stale turn generation or barge-in interruption while streaming
+		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
+			return ctx.Err()
 		}
-	}
 
-	select {
-	case s.audioOut <- audioChunk:
-		metrics.DefaultMetrics.IncFrame()
-	default:
-	}
-	s.mu.Unlock()
+		// Record accurate Time-to-First-Audio (TTFA) upon arrival of the very FIRST synthesized audio frame
+		s.mu.Lock()
+		if s.activeTurnMetrics != nil && s.activeTurnMetrics.FirstAudioReadyAt.IsZero() {
+			now := time.Now()
+			s.activeTurnMetrics.FirstAudioReadyAt = now
+			if !s.activeTurnMetrics.UserSilenceDetectedAt.IsZero() {
+				ttfa := now.Sub(s.activeTurnMetrics.UserSilenceDetectedAt)
+				s.activeTurnMetrics.TTFA = ttfa
+				metrics.DefaultMetrics.RecordTTFA(ttfa)
+				logger.L.Info("time_to_first_audio_recorded",
+					"session_id", s.sessionID,
+					"turn_id", chunk.TurnID,
+					"ttfa_ms", ttfa.Milliseconds(),
+				)
+			}
+		}
+		s.mu.Unlock()
 
-	s.emitEvent(&model.TurnEvent{
-		Type:      model.EventTTSAudioChunk,
-		SessionID: s.sessionID,
-		TurnID:    chunk.TurnID,
-		Payload:   chunk.Text,
-		Timestamp: time.Now().UnixMilli(),
+		// Advance FSM to Speaking state upon arrival of first audio frame
+		if s.fsm.Is(model.StateThinking) {
+			_ = s.fsm.Transition(model.StateSpeaking)
+		}
+
+		// Calculate frame duration dynamically based on 16kHz, 16-bit mono linear PCM format (32 bytes per ms)
+		durationMs := len(pcmFrame) / 32
+		if durationMs == 0 && len(pcmFrame) > 0 {
+			durationMs = 1
+		}
+
+		audioChunk := &model.AudioChunk{
+			SessionID:  s.sessionID,
+			TurnID:     chunk.TurnID,
+			ChunkIdx:   chunk.Index*1000 + frameIdx,
+			Data:       pcmFrame,
+			DurationMs: int64(durationMs),
+			Timestamp:  time.Now().UnixMilli(),
+		}
+		frameIdx++
+
+		s.mu.RLock()
+		hook := s.synthesisBarrierHook
+		s.mu.RUnlock()
+		if hook != nil {
+			hook(turnGen)
+		}
+
+		// Guarded enqueue to guarantee no stale frame from an interrupted turn ever enters audioOut
+		s.mu.Lock()
+		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
+			s.mu.Unlock()
+			return ctx.Err()
+		}
+
+		// High watermark backpressure: drop oldest unconsumed packet if buffer exceeds 256 chunks
+		if len(s.audioOut) >= 256 {
+			select {
+			case <-s.audioOut:
+				logger.L.Warn("audio_buffer_high_watermark_dropped_oldest", "session_id", s.sessionID)
+			default:
+			}
+		}
+
+		select {
+		case s.audioOut <- audioChunk:
+			metrics.DefaultMetrics.IncFrame()
+		default:
+			logger.L.Warn("audio_out_queue_full_dropped_frame", "session_id", s.sessionID)
+		}
+		s.mu.Unlock()
+
+		s.emitEvent(&model.TurnEvent{
+			Type:      model.EventTTSAudioChunk,
+			SessionID: s.sessionID,
+			TurnID:    chunk.TurnID,
+			Payload:   chunk.Text,
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+		return nil
 	})
+
+	if err != nil && ctx.Err() == nil {
+		logger.L.Error("streaming_synthesis_failed", "session_id", s.sessionID, "turn_id", chunk.TurnID, "error", err)
+	}
 }
 
 // TriggerBargeIn instantly cancels in-flight LLM/TTS generation, drains output buffers, and resets state

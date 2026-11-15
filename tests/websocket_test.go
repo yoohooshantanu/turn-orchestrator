@@ -318,7 +318,7 @@ func TestCartesiaProviderLifecycleAndFallback(t *testing.T) {
 		t.Errorf("expected error when synthesizing with closed provider")
 	}
 
-	// 4. Live streaming with mock Cartesia WebSocket server streaming multiple chunks followed by done frame
+	// 4. Live streaming with mock Cartesia WebSocket server streaming multiple chunks incrementally followed by done frame
 	upgrader := websocket.Upgrader{}
 	chunk1 := pipeline.GenerateFormantAudioPCM(100)
 	chunk2 := pipeline.GenerateFormantAudioPCM(500)
@@ -369,20 +369,159 @@ func TestCartesiaProviderLifecycleAndFallback(t *testing.T) {
 	liveCartesia := pipeline.NewCartesiaStreamingTTS("test-cartesia-key", "sonic-english", "test-voice")
 	liveCartesia.SetEndpoint(mockServer.URL)
 
-	audio, err := liveCartesia.SynthesizeChunk(context.Background(), "Live Cartesia stream", 0)
+	// Test incremental frame-by-frame streaming via SynthesizeStream
+	var receivedStreamFrames [][]byte
+	err = liveCartesia.SynthesizeStream(context.Background(), "Live Cartesia stream", 0, func(pcmFrame []byte) error {
+		receivedStreamFrames = append(receivedStreamFrames, pcmFrame)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("expected successful multi-frame synthesis from mock Cartesia, got %v", err)
+		t.Fatalf("expected successful incremental streaming from mock Cartesia, got %v", err)
 	}
-	if len(audio) != expectedTotalLen {
-		t.Errorf("expected %d total accumulated bytes from all Cartesia chunks, got %d", expectedTotalLen, len(audio))
+	if len(receivedStreamFrames) != 2 {
+		t.Fatalf("expected 2 incremental audio frames delivered to callback, got %d", len(receivedStreamFrames))
+	}
+	if len(receivedStreamFrames[0]) != len(chunk1) || len(receivedStreamFrames[1]) != len(chunk2) {
+		t.Errorf("frame byte lengths mismatch: frame1=%d, frame2=%d", len(receivedStreamFrames[0]), len(receivedStreamFrames[1]))
 	}
 
-	// 5. Explicit error propagation when real API key is configured but connection fails
+	// Also verify SynthesizeChunk returns the complete accumulated stream
+	audio, err := liveCartesia.SynthesizeChunk(context.Background(), "Live Cartesia stream", 0)
+	if err != nil {
+		t.Fatalf("expected successful chunk synthesis from mock Cartesia, got %v", err)
+	}
+	if len(audio) != expectedTotalLen {
+		t.Errorf("expected %d total accumulated bytes, got %d", expectedTotalLen, len(audio))
+	}
+
+	// 5. Explicit error on premature server closure before done
+	prematureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		var req map[string]interface{}
+		_ = conn.ReadJSON(&req)
+		// Send chunk then abruptly close without done frame
+		b64Chunk := base64.StdEncoding.EncodeToString(chunk1)
+		_ = conn.WriteJSON(map[string]interface{}{
+			"type": "chunk",
+			"data": b64Chunk,
+			"done": false,
+		})
+		conn.Close()
+	}))
+	defer prematureServer.Close()
+
+	prematureCartesia := pipeline.NewCartesiaStreamingTTS("test-cartesia-key", "sonic-english", "test-voice")
+	prematureCartesia.SetEndpoint(prematureServer.URL)
+	_, err = prematureCartesia.SynthesizeChunk(context.Background(), "Incomplete stream", 0)
+	if err == nil {
+		t.Errorf("expected error on premature stream termination before done confirmation")
+	}
+
+	// 6. Active read context cancellation immediately unblocks ReadMessage
+	hangingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var req map[string]interface{}
+		_ = conn.ReadJSON(&req)
+		// Hang indefinitely without writing response
+		time.Sleep(5 * time.Second)
+	}))
+	defer hangingServer.Close()
+
+	hangingCartesia := pipeline.NewCartesiaStreamingTTS("test-cartesia-key", "sonic-english", "test-voice")
+	hangingCartesia.SetEndpoint(hangingServer.URL)
+	cancelCtx, cancelFn := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelFn()
+
+	startCancel := time.Now()
+	_, err = hangingCartesia.SynthesizeChunk(cancelCtx, "Hanging read", 0)
+	elapsedCancel := time.Since(startCancel)
+	if err == nil {
+		t.Errorf("expected cancellation error from hanging read")
+	}
+	if elapsedCancel > 1500*time.Millisecond {
+		t.Errorf("expected immediate context cancellation interrupt (<1.5s), took %v", elapsedCancel)
+	}
+
+	// 7. Explicit error propagation when real API key is configured but connection fails
 	failingCartesia := pipeline.NewCartesiaStreamingTTS("bad-key", "sonic-english", "test-voice")
 	failingCartesia.SetEndpoint("ws://127.0.0.1:59999/nonexistent")
 	_, err = failingCartesia.SynthesizeChunk(context.Background(), "Should fail", 0)
 	if err == nil {
 		t.Errorf("expected explicit error when Cartesia connection fails with configured API key")
+	}
+}
+
+// MockDelayedTTS delays 40ms before emitting first frame to verify genuine TTFA calculation
+type MockDelayedTTS struct {
+	delay time.Duration
+}
+
+func (m *MockDelayedTTS) SynthesizeStream(ctx context.Context, text string, chunkIdx int, onAudioFrame pipeline.AudioChunkHandler) error {
+	select {
+	case <-time.After(m.delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	pcm := pipeline.GenerateFormantAudioPCM(0)
+	if onAudioFrame != nil {
+		return onAudioFrame(pcm)
+	}
+	return nil
+}
+
+func (m *MockDelayedTTS) SynthesizeChunk(ctx context.Context, text string, chunkIdx int) ([]byte, error) {
+	select {
+	case <-time.After(m.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return pipeline.GenerateFormantAudioPCM(0), nil
+}
+
+func (m *MockDelayedTTS) Close() error {
+	return nil
+}
+
+func TestTimeToFirstAudioMeasurementWithDelayedProvider(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_delayed_ttfa_test")
+	defer session.Close()
+
+	// Configure delayed provider with 40ms synthesis latency
+	delayedTTS := &MockDelayedTTS{delay: 40 * time.Millisecond}
+	session.SetTTSProvider(delayedTTS)
+
+	// Advance session into speaking turn
+	session.StartSpeakingTurnForBench()
+DrainInitial:
+	for {
+		select {
+		case <-session.AudioOut():
+		default:
+			break DrainInitial
+		}
+	}
+
+	tokenCh := make(chan string, 1)
+	session.StartLLMResponseStream(tokenCh)
+	tokenCh <- "Testing time to first audio measurement."
+	close(tokenCh)
+
+	select {
+	case chunk := <-session.AudioOut():
+		// Verify dynamic duration calculation for 640 bytes (16kHz 16-bit mono PCM = 32 bytes/ms)
+		expectedDuration := int64(len(chunk.Data) / 32)
+		if chunk.DurationMs != expectedDuration {
+			t.Errorf("expected dynamic duration %d ms, got %d ms", expectedDuration, chunk.DurationMs)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for delayed synthesized audio frame")
 	}
 }
 

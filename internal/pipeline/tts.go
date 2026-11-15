@@ -15,9 +15,13 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/logger"
 )
 
+// AudioChunkHandler is called incrementally for each incoming synthesized audio frame
+type AudioChunkHandler func(pcmFrame []byte) error
+
 // StreamingTTSProvider models a real-time streaming text-to-speech synthesizer interface.
 // Production implementations stream synthetic PCM audio from cloud providers (e.g. Cartesia Sonic).
 type StreamingTTSProvider interface {
+	SynthesizeStream(ctx context.Context, text string, chunkIdx int, onAudioFrame AudioChunkHandler) error
 	SynthesizeChunk(ctx context.Context, text string, chunkIdx int) ([]byte, error)
 	Close() error
 }
@@ -30,6 +34,17 @@ type FormantTestHarnessTTS struct{}
 
 func NewFormantTestHarnessTTS() *FormantTestHarnessTTS {
 	return &FormantTestHarnessTTS{}
+}
+
+func (f *FormantTestHarnessTTS) SynthesizeStream(ctx context.Context, text string, chunkIdx int, onAudioFrame AudioChunkHandler) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	pcm := GenerateFormantAudioPCM(chunkIdx * 320)
+	if onAudioFrame != nil {
+		return onAudioFrame(pcm)
+	}
+	return nil
 }
 
 func (f *FormantTestHarnessTTS) SynthesizeChunk(ctx context.Context, text string, chunkIdx int) ([]byte, error) {
@@ -45,12 +60,13 @@ func (f *FormantTestHarnessTTS) Close() error {
 
 // CartesiaStreamingTTS is the production provider adapter for Cartesia Sonic WebSocket streaming TTS
 type CartesiaStreamingTTS struct {
-	mu       sync.Mutex
-	apiKey   string
-	modelID  string
-	voiceID  string
-	endpoint string
-	closed   bool
+	mu         sync.Mutex
+	apiKey     string
+	modelID    string
+	voiceID    string
+	endpoint   string
+	closed     bool
+	activeConn *websocket.Conn
 }
 
 func NewCartesiaStreamingTTS(apiKey, modelID, voiceID string) *CartesiaStreamingTTS {
@@ -75,23 +91,27 @@ func (c *CartesiaStreamingTTS) SetEndpoint(endpoint string) {
 	c.endpoint = endpoint
 }
 
-// SynthesizeChunk connects to Cartesia Sonic WebSocket, streams the chunk request, and consumes all incoming audio frames
-func (c *CartesiaStreamingTTS) SynthesizeChunk(ctx context.Context, text string, chunkIdx int) ([]byte, error) {
+// SynthesizeStream connects to Cartesia Sonic WebSocket, streams the request, and emits audio frames incrementally as they arrive
+func (c *CartesiaStreamingTTS) SynthesizeStream(ctx context.Context, text string, chunkIdx int, onAudioFrame AudioChunkHandler) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, fmt.Errorf("cartesia tts provider closed")
+		return fmt.Errorf("cartesia tts provider closed")
 	}
 	endpoint := c.endpoint
 	c.mu.Unlock()
 
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
 
 	if c.apiKey == "" {
 		// Deterministic offline test harness fallback when API key is not configured
-		return GenerateFormantAudioPCM(chunkIdx * 320), nil
+		pcm := GenerateFormantAudioPCM(chunkIdx * 320)
+		if onAudioFrame != nil {
+			return onAudioFrame(pcm)
+		}
+		return nil
 	}
 
 	dialer := websocket.Dialer{
@@ -117,9 +137,36 @@ func (c *CartesiaStreamingTTS) SynthesizeChunk(ctx context.Context, text string,
 			_ = resp.Body.Close()
 		}
 		logger.L.Error("cartesia_websocket_dial_failed", "endpoint", wsEndpoint, "error", err)
-		return nil, fmt.Errorf("cartesia websocket dial error: %w", err)
+		return fmt.Errorf("cartesia websocket dial error: %w", err)
 	}
 	defer conn.Close()
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("cartesia tts provider closed")
+	}
+	c.activeConn = conn
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		if c.activeConn == conn {
+			c.activeConn = nil
+		}
+		c.mu.Unlock()
+	}()
+
+	// Asynchronous context cancellation watcher: immediately interrupts blocking WebSocket ReadMessage on cancellation / barge-in
+	cancelDone := make(chan struct{})
+	defer close(cancelDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-cancelDone:
+		}
+	}()
 
 	// Structured Cartesia WebSocket request frame
 	reqPayload := map[string]interface{}{
@@ -140,28 +187,37 @@ func (c *CartesiaStreamingTTS) SynthesizeChunk(ctx context.Context, text string,
 
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if err := conn.WriteJSON(reqPayload); err != nil {
-		return nil, fmt.Errorf("cartesia write request failed: %w", err)
+		return fmt.Errorf("cartesia write request failed: %w", err)
 	}
 
-	// Consume all streaming audio response frames until type: "done"
-	var accumulatedAudio []byte
+	receivedFrames := 0
+	receivedDone := false
 
+	// Stream read loop: delivers audio frames incrementally to onAudioFrame callback
 	for {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
-			if len(accumulatedAudio) > 0 {
-				return accumulatedAudio, nil
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			return nil, fmt.Errorf("cartesia stream read error: %w", err)
+			if !receivedDone {
+				return fmt.Errorf("cartesia stream terminated prematurely before done: %w", err)
+			}
+			break
 		}
 
 		if msgType == websocket.BinaryMessage && len(payload) > 0 {
-			accumulatedAudio = append(accumulatedAudio, payload...)
+			receivedFrames++
+			if onAudioFrame != nil {
+				if err := onAudioFrame(payload); err != nil {
+					return err
+				}
+			}
 		} else if msgType == websocket.TextMessage {
 			var respFrame struct {
 				Type  string `json:"type"`
@@ -171,31 +227,57 @@ func (c *CartesiaStreamingTTS) SynthesizeChunk(ctx context.Context, text string,
 			}
 			if err := json.Unmarshal(payload, &respFrame); err == nil {
 				if respFrame.Error != "" {
-					return nil, fmt.Errorf("cartesia api error: %s", respFrame.Error)
+					return fmt.Errorf("cartesia api error: %s", respFrame.Error)
 				}
 				if respFrame.Data != "" {
 					decoded, err := base64.StdEncoding.DecodeString(respFrame.Data)
 					if err == nil && len(decoded) > 0 {
-						accumulatedAudio = append(accumulatedAudio, decoded...)
+						receivedFrames++
+						if onAudioFrame != nil {
+							if err := onAudioFrame(decoded); err != nil {
+								return err
+							}
+						}
 					}
 				}
 				if respFrame.Type == "done" || respFrame.Done {
+					receivedDone = true
 					break
 				}
 			}
 		}
 	}
 
-	if len(accumulatedAudio) > 0 {
-		return accumulatedAudio, nil
+	if !receivedDone {
+		return fmt.Errorf("cartesia stream ended without done confirmation")
 	}
-	return nil, fmt.Errorf("cartesia stream returned zero audio bytes")
+	if receivedFrames == 0 {
+		return fmt.Errorf("cartesia stream returned zero audio frames")
+	}
+	return nil
+}
+
+// SynthesizeChunk connects to Cartesia Sonic WebSocket, streams the chunk request, and consumes all incoming audio frames
+func (c *CartesiaStreamingTTS) SynthesizeChunk(ctx context.Context, text string, chunkIdx int) ([]byte, error) {
+	var accumulatedAudio []byte
+	err := c.SynthesizeStream(ctx, text, chunkIdx, func(pcmFrame []byte) error {
+		accumulatedAudio = append(accumulatedAudio, pcmFrame...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return accumulatedAudio, nil
 }
 
 func (c *CartesiaStreamingTTS) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
+	if c.activeConn != nil {
+		_ = c.activeConn.Close()
+		c.activeConn = nil
+	}
 	return nil
 }
 
