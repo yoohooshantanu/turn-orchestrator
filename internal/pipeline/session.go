@@ -18,6 +18,11 @@ import (
 
 type EventListener func(event *model.TurnEvent)
 
+type queuedSentence struct {
+	chunk   *model.SentenceChunk
+	turnGen uint64
+}
+
 // VoiceSession coordinates the real-time full-duplex conversational turn loop
 type VoiceSession struct {
 	mu                sync.RWMutex
@@ -26,6 +31,8 @@ type VoiceSession struct {
 	vad               *vad.VoiceActivityDetector
 	currentTurnID     string
 	turnCount         uint64
+	turnGen           uint64
+	activeTurnGen     uint64
 	activeTurnCtx     context.Context
 	activeTurnCancel  context.CancelFunc
 	activeTurnMetrics *model.TurnMetrics
@@ -87,6 +94,10 @@ func (s *VoiceSession) SessionID() string {
 
 func (s *VoiceSession) State() model.ConversationState {
 	return s.fsm.Current()
+}
+
+func (s *VoiceSession) FSM() *fsm.TurnFSM {
+	return s.fsm
 }
 
 func (s *VoiceSession) IsClosed() bool {
@@ -181,6 +192,11 @@ func (s *VoiceSession) IngestAudio(frame *model.AudioFrame) error {
 }
 
 func (s *VoiceSession) handleUserSpeechStart(t time.Time) {
+	curr := s.fsm.Current()
+	if curr == model.StateSpeaking || curr == model.StateThinking || curr == model.StateDraining {
+		s.TriggerBargeIn()
+	}
+
 	s.emitEvent(&model.TurnEvent{
 		Type:      model.EventUserSpeechStart,
 		SessionID: s.sessionID,
@@ -196,6 +212,8 @@ func (s *VoiceSession) handleUserSpeechEnd(silenceDetectedAt time.Time, speechDu
 	}
 
 	turnNum := atomic.AddUint64(&s.turnCount, 1)
+	turnGen := atomic.AddUint64(&s.turnGen, 1)
+	s.activeTurnGen = turnGen
 	turnID := fmt.Sprintf("turn_%s_%d", s.sessionID, turnNum)
 	s.currentTurnID = turnID
 
@@ -230,39 +248,81 @@ func (s *VoiceSession) handleUserSpeechEnd(silenceDetectedAt time.Time, speechDu
 	})
 }
 
+// StartSpeakingTurnForBench initializes an active turn in SPEAKING state with cancelable context and buffered audio chunks
+func (s *VoiceSession) StartSpeakingTurnForBench() {
+	s.mu.Lock()
+	s.turnCount++
+	turnGen := atomic.AddUint64(&s.turnGen, 1)
+	s.activeTurnGen = turnGen
+	turnID := fmt.Sprintf("turn_bench_%d", s.turnCount)
+	s.currentTurnID = turnID
+
+	turnCtx, cancel := context.WithCancel(context.Background())
+	s.activeTurnCtx = turnCtx
+	s.activeTurnCancel = cancel
+	s.activeTurnMetrics = &model.TurnMetrics{
+		SessionID: s.sessionID,
+		TurnID:    turnID,
+	}
+
+	// Pre-fill audio buffer with speech chunks
+	for i := 0; i < 5; i++ {
+		chunk := &model.AudioChunk{
+			SessionID:  s.sessionID,
+			TurnID:     turnID,
+			ChunkIdx:   i,
+			Data:       make([]byte, 640),
+			DurationMs: 20,
+			Timestamp:  time.Now().UnixMilli(),
+		}
+		select {
+		case s.audioOut <- chunk:
+		default:
+		}
+	}
+	s.mu.Unlock()
+
+	if s.fsm.Is(model.StateListening) {
+		_ = s.fsm.Transition(model.StateThinking)
+	}
+	_ = s.fsm.Transition(model.StateSpeaking)
+}
+
 // StartLLMResponseStream simulates/receives LLM streaming tokens for the current turn
 func (s *VoiceSession) StartLLMResponseStream(tokenStream <-chan string) {
-	s.mu.RLock()
+	s.mu.Lock()
 	turnID := s.currentTurnID
 	turnCtx := s.activeTurnCtx
-	s.mu.RUnlock()
+	turnGen := s.activeTurnGen
+	s.mu.Unlock()
 
 	if turnID == "" || turnCtx == nil {
 		return
 	}
 
 	// Sequential synthesis pipeline: guarantees strict in-order audio emission to telephony output
-	sentenceCh := make(chan *model.SentenceChunk, 64)
+	sentenceCh := make(chan queuedSentence, 64)
 
 	go func() {
 		for {
 			select {
 			case <-turnCtx.Done():
 				return
-			case chunk, ok := <-sentenceCh:
+			case item, ok := <-sentenceCh:
 				if !ok {
 					return
 				}
-				s.synthesizeAndStream(turnCtx, chunk)
+				s.synthesizeAndStream(turnCtx, item.chunk, item.turnGen)
 			}
 		}
 	}()
 
 	chunkerEngine := chunker.NewSentenceChunker(s.sessionID, turnID, func(chunk *model.SentenceChunk) {
+		metrics.DefaultMetrics.IncSentence()
 		s.handleSentenceReady(turnCtx, chunk)
 		select {
 		case <-turnCtx.Done():
-		case sentenceCh <- chunk:
+		case sentenceCh <- queuedSentence{chunk: chunk, turnGen: turnGen}:
 		}
 	})
 
@@ -318,14 +378,12 @@ func (s *VoiceSession) handleSentenceReady(ctx context.Context, chunk *model.Sen
 	})
 }
 
-func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.SentenceChunk) {
-	select {
-	case <-ctx.Done():
+func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.SentenceChunk, turnGen uint64) {
+	if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 		return
-	default:
 	}
 
-	// Simulated neural TTS synthesis latency (20ms for first chunk, 40ms for rest)
+	// Simulated neural TTS synthesis latency (15ms for first chunk, 35ms for rest)
 	delay := 35 * time.Millisecond
 	if chunk.IsFirstChunk {
 		delay = 15 * time.Millisecond
@@ -334,6 +392,10 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 	select {
 	case <-time.After(delay):
 	case <-ctx.Done():
+		return
+	}
+
+	if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 		return
 	}
 
@@ -358,19 +420,30 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		_ = s.fsm.Transition(model.StateSpeaking)
 	}
 
-	// Generate audio bytes payload
-	audioBytes := []byte(fmt.Sprintf("TTS_AUDIO_PAYLOAD[%s:%d]", chunk.TurnID, chunk.Index))
+	// Real 16kHz 16-bit linear PCM audio chunk (640 bytes = 20ms of audio)
+	audioBytes := make([]byte, 640)
+	for i := 0; i < len(audioBytes); i += 2 {
+		audioBytes[i] = byte(i & 0xFF)
+		audioBytes[i+1] = 0x20
+	}
+
 	audioChunk := &model.AudioChunk{
 		SessionID:  s.sessionID,
 		TurnID:     chunk.TurnID,
 		ChunkIdx:   chunk.Index,
 		Data:       audioBytes,
-		DurationMs: 400,
+		DurationMs: 20,
 		Timestamp:  time.Now().UnixMilli(),
 	}
 
-	// Bounded output buffer backpressure: if audioOut buffer exceeds 256 chunks (~100s audio),
-	// drop the oldest unconsumed audio packet to prevent stale playback accumulation on lagging clients
+	// Guarded enqueue to guarantee no stale chunk from an interrupted turn ever enters audioOut
+	s.mu.Lock()
+	if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+
+	// High watermark backpressure: drop oldest unconsumed packet if buffer exceeds 256 chunks
 	if len(s.audioOut) >= 256 {
 		select {
 		case <-s.audioOut:
@@ -380,13 +453,11 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 	}
 
 	select {
-	case <-ctx.Done():
-		return
-	case <-s.stopCh:
-		return
 	case s.audioOut <- audioChunk:
 		metrics.DefaultMetrics.IncFrame()
+	default:
 	}
+	s.mu.Unlock()
 
 	s.emitEvent(&model.TurnEvent{
 		Type:      model.EventTTSAudioChunk,
@@ -412,6 +483,9 @@ func (s *VoiceSession) TriggerBargeIn() {
 		s.mu.Unlock()
 		return
 	}
+
+	// Invalidate in-flight and future audio chunks from this turn
+	atomic.AddUint64(&s.turnGen, 1)
 
 	// 1. Immediately cancel the active turn context
 	if s.activeTurnCancel != nil {

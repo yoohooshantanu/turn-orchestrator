@@ -16,13 +16,24 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/metrics"
 	"github.com/yoohooshantanu/vocalflow/internal/model"
 	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
+	"github.com/yoohooshantanu/vocalflow/internal/vad"
 )
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  2048,
-	WriteBufferSize: 2048,
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Demo & dashboard cross-origin support
+		allowed := os.Getenv("ALLOWED_ORIGINS")
+		if allowed == "" || allowed == "*" {
+			return true
+		}
+		origin := r.Header.Get("Origin")
+		for _, o := range strings.Split(allowed, ",") {
+			if strings.TrimSpace(o) == origin {
+				return true
+			}
+		}
+		return false
 	},
 }
 
@@ -63,7 +74,7 @@ func main() {
 		})
 	})
 
-	// 2. Full-Duplex WebSocket Conversational Gateway
+	// 2. Full-Duplex Binary & Text WebSocket Conversational Gateway
 	mux.HandleFunc("/ws/voice/", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		if len(parts) < 3 || parts[0] != "ws" || parts[1] != "voice" {
@@ -88,41 +99,61 @@ func main() {
 		clientCtx, clientCancel := context.WithCancel(r.Context())
 		defer clientCancel()
 
-		// Emitter loop: Push audio frames and events to telephony client
+		// Emitter loop: Push binary audio frames and control events to telephony client
 		go func() {
 			for {
 				select {
 				case <-clientCtx.Done():
 					return
-				case <-session.AudioOut():
-					// Transmit synthesized audio chunk
-					msg := map[string]interface{}{
-						"type":       "audio_chunk",
-						"session_id": sessionID,
-						"timestamp":  time.Now().UnixMilli(),
+				case chunk, ok := <-session.AudioOut():
+					if !ok {
+						return
 					}
-					_ = conn.WriteJSON(msg)
+					// Transmit raw PCM audio chunk bytes directly to client
+					if err := conn.WriteMessage(websocket.BinaryMessage, chunk.Data); err != nil {
+						return
+					}
 
 				case evt, ok := <-session.EventOut():
 					if !ok {
 						return
 					}
-					_ = conn.WriteJSON(evt)
+					if err := conn.WriteJSON(evt); err != nil {
+						return
+					}
 				}
 			}
 		}()
 
-		// Ingestion loop: Receive audio or control frames from telephony client
+		// Ingestion loop: Receive raw PCM binary audio or control frames from telephony client
 		for {
+			messageType, payload, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+
+			// Binary Frame: Ingest raw 16-bit linear PCM audio bytes (16kHz mono)
+			if messageType == websocket.BinaryMessage {
+				if len(payload) > 0 {
+					energy := vad.ComputeRMSEnergy(payload)
+					_ = session.IngestAudio(&model.AudioFrame{
+						SessionID: sessionID,
+						Data:      payload,
+						Energy:    energy,
+						Timestamp: time.Now().UnixMilli(),
+					})
+				}
+				continue
+			}
+
+			// Text Frame: Ingest JSON control commands
 			var inMsg struct {
 				Type     string  `json:"type"`
 				Energy   float64 `json:"energy"`
-				Token    string  `json:"token"`
 				IsVoiced bool    `json:"is_voiced"`
 			}
-
-			if err := conn.ReadJSON(&inMsg); err != nil {
-				break
+			if err := json.Unmarshal(payload, &inMsg); err != nil {
+				continue
 			}
 
 			switch inMsg.Type {

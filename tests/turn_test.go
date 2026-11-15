@@ -489,3 +489,41 @@ func TestWebSocketSessionReconnectRecovery(t *testing.T) {
 		t.Errorf("expected state %s, got %s", sess.State(), reconnectedSess.State())
 	}
 }
+
+func TestStaleAudioDroppedAfterBargeIn(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_stale_audio_test")
+	defer session.Close()
+
+	tokenCh := make(chan string, 10)
+
+	// Start speaking turn with initial audio
+	session.StartSpeakingTurnForBench()
+
+	// Start LLM stream with delayed synthesis
+	session.StartLLMResponseStream(tokenCh)
+	tokenCh <- "First"
+	tokenCh <- " sentence"
+	tokenCh <- " being"
+	tokenCh <- " generated."
+
+	// Interrupt immediately
+	session.TriggerBargeIn()
+
+	if session.State() != model.StateListening {
+		t.Errorf("expected state LISTENING after barge-in, got %s", session.State())
+	}
+
+	close(tokenCh)
+
+	// Allow background workers to finish
+	time.Sleep(50 * time.Millisecond)
+
+	// Stale audio chunks from the cancelled turn generation must NOT be in audioOut
+	select {
+	case chunk := <-session.AudioOut():
+		t.Fatalf("stale audio chunk detected in output queue after barge-in: turn=%s, idx=%d", chunk.TurnID, chunk.ChunkIdx)
+	default:
+		// Cleanly empty
+	}
+}
+

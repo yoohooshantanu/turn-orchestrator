@@ -17,12 +17,12 @@ type Metrics struct {
 	TotalTokensStreamed uint64
 	TotalSentences      uint64
 
-	// Latency trackers in microseconds
-	sumTTFAMs        uint64
-	countTTFA        uint64
-	sumBargeInMs     uint64
-	countBargeIn     uint64
-	activeSessions   int64
+	// Sub-millisecond latency trackers in microseconds
+	sumTTFAUs      uint64
+	countTTFA      uint64
+	sumBargeInUs   uint64
+	countBargeIn   uint64
+	activeSessions int64
 }
 
 var DefaultMetrics = NewMetrics()
@@ -47,12 +47,12 @@ func (m *Metrics) IncTurn(interrupted bool) {
 }
 
 func (m *Metrics) RecordTTFA(d time.Duration) {
-	atomic.AddUint64(&m.sumTTFAMs, uint64(d.Milliseconds()))
+	atomic.AddUint64(&m.sumTTFAUs, uint64(d.Microseconds()))
 	atomic.AddUint64(&m.countTTFA, 1)
 }
 
 func (m *Metrics) RecordBargeIn(d time.Duration) {
-	atomic.AddUint64(&m.sumBargeInMs, uint64(d.Milliseconds()))
+	atomic.AddUint64(&m.sumBargeInUs, uint64(d.Microseconds()))
 	atomic.AddUint64(&m.countBargeIn, 1)
 }
 
@@ -77,16 +77,16 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		frames := atomic.LoadUint64(&m.TotalAudioFrames)
 		sessions := atomic.LoadInt64(&m.activeSessions)
 
-		avgTTFA := float64(0)
+		avgTTFAMs := float64(0)
 		cTTFA := atomic.LoadUint64(&m.countTTFA)
 		if cTTFA > 0 {
-			avgTTFA = float64(atomic.LoadUint64(&m.sumTTFAMs)) / float64(cTTFA)
+			avgTTFAMs = (float64(atomic.LoadUint64(&m.sumTTFAUs)) / float64(cTTFA)) / 1000.0
 		}
 
-		avgBargeIn := float64(0)
+		avgBargeInMs := float64(0)
 		cBargeIn := atomic.LoadUint64(&m.countBargeIn)
 		if cBargeIn > 0 {
-			avgBargeIn = float64(atomic.LoadUint64(&m.sumBargeInMs)) / float64(cBargeIn)
+			avgBargeInMs = (float64(atomic.LoadUint64(&m.sumBargeInUs)) / float64(cBargeIn)) / 1000.0
 		}
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
@@ -104,19 +104,22 @@ func (m *Metrics) Handler() http.HandlerFunc {
 
 		fmt.Fprintf(w, "# HELP vocalflow_avg_ttfa_ms Average Time to First Audio in milliseconds\n")
 		fmt.Fprintf(w, "# TYPE vocalflow_avg_ttfa_ms gauge\n")
-		fmt.Fprintf(w, "vocalflow_avg_ttfa_ms %.2f\n", avgTTFA)
+		fmt.Fprintf(w, "vocalflow_avg_ttfa_ms %.3f\n", avgTTFAMs)
 
-		fmt.Fprintf(w, "# HELP vocalflow_avg_barge_in_reaction_ms Average barge-in cancellation latency\n")
+		fmt.Fprintf(w, "# HELP vocalflow_avg_barge_in_reaction_ms Average barge-in cancellation latency in milliseconds\n")
 		fmt.Fprintf(w, "# TYPE vocalflow_avg_barge_in_reaction_ms gauge\n")
-		fmt.Fprintf(w, "vocalflow_avg_barge_in_reaction_ms %.2f\n", avgBargeIn)
+		fmt.Fprintf(w, "vocalflow_avg_barge_in_reaction_ms %.3f\n", avgBargeInMs)
 
 		fmt.Fprintf(w, "# HELP vocalflow_total_tokens_streamed Total LLM tokens streamed\n")
 		fmt.Fprintf(w, "# TYPE vocalflow_total_tokens_streamed counter\n")
 		fmt.Fprintf(w, "vocalflow_total_tokens_streamed %d\n", tokens)
 
+		fmt.Fprintf(w, "# HELP vocalflow_total_audio_frames Total PCM audio frames processed\n")
+		fmt.Fprintf(w, "# TYPE vocalflow_total_audio_frames counter\n")
+		fmt.Fprintf(w, "vocalflow_total_audio_frames %d\n", frames)
+
 		fmt.Fprintf(w, "# HELP vocalflow_total_sentences_synthesized Total sentences pipelined to TTS\n")
 		fmt.Fprintf(w, "# TYPE vocalflow_total_sentences_synthesized counter\n")
-		fmt.Fprintf(w, "vocalflow_total_sentences_synthesized %d\n", frames)
-		_ = sentences
+		fmt.Fprintf(w, "vocalflow_total_sentences_synthesized %d\n", sentences)
 	}
 }
