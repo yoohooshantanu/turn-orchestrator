@@ -82,13 +82,15 @@ func main() {
 		session := mgr.GetOrCreate(sessionID)
 		defer mgr.Delete(sessionID)
 
-		clientDone := make(chan struct{})
+		clientCtx, clientCancel := context.WithCancel(r.Context())
+		defer clientCancel()
 
 		// Emitter loop: Push audio frames and events to telephony client
 		go func() {
-			defer close(clientDone)
 			for {
 				select {
+				case <-clientCtx.Done():
+					return
 				case <-session.AudioOut():
 					// Transmit synthesized audio chunk
 					msg := map[string]interface{}{

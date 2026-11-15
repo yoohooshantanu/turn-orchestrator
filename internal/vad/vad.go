@@ -82,9 +82,15 @@ func ComputeRMSEnergy(pcm []byte) float64 {
 
 // ProcessFrame inspects an audio frame, updates energy tracking, and fires state transitions
 func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	var (
+		fireBargeIn       bool
+		fireSpeechStart   bool
+		fireSpeechEnd     bool
+		eventTime         time.Time
+		speechTurnDur     time.Duration
+	)
 
+	v.mu.Lock()
 	now := time.Now()
 	metrics.DefaultMetrics.IncFrame()
 
@@ -116,15 +122,11 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 			v.speechStartTime = now
 			v.lastVoicedTime = now
 
-			if v.callbacks.OnBargeIn != nil {
-				v.callbacks.OnBargeIn(now)
-			}
-			return
+			fireBargeIn = true
+			eventTime = now
 		}
-	}
-
-	// 2. Normal Turn-Taking Processing in LISTENING state
-	if isVoiced {
+	} else if isVoiced {
+		// 2. Normal Turn-Taking Processing in LISTENING state
 		v.consecVoiced++
 		v.consecUnvoiced = 0
 		v.lastVoicedTime = now
@@ -132,9 +134,8 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 		if !v.isSpeaking && v.consecVoiced >= 2 {
 			v.isSpeaking = true
 			v.speechStartTime = now
-			if v.callbacks.OnSpeechStart != nil {
-				v.callbacks.OnSpeechStart(now)
-			}
+			fireSpeechStart = true
+			eventTime = now
 		}
 	} else {
 		v.consecUnvoiced++
@@ -153,11 +154,24 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 					"silence_hangover_ms", silenceDuration.Milliseconds(),
 				)
 
-				if v.callbacks.OnSpeechEnd != nil {
-					v.callbacks.OnSpeechEnd(now, turnDuration)
-				}
+				fireSpeechEnd = true
+				eventTime = now
+				speechTurnDur = turnDuration
 			}
 		}
+	}
+	v.mu.Unlock()
+
+	// Invoke callbacks outside the lock to prevent re-entrant deadlocks
+	// (e.g. OnBargeIn -> TriggerBargeIn -> vad.Reset() acquiring v.mu.Lock())
+	if fireBargeIn && v.callbacks.OnBargeIn != nil {
+		v.callbacks.OnBargeIn(eventTime)
+	}
+	if fireSpeechStart && v.callbacks.OnSpeechStart != nil {
+		v.callbacks.OnSpeechStart(eventTime)
+	}
+	if fireSpeechEnd && v.callbacks.OnSpeechEnd != nil {
+		v.callbacks.OnSpeechEnd(eventTime, speechTurnDur)
 	}
 }
 

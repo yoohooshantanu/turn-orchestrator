@@ -233,3 +233,53 @@ func TestConcurrentVoiceSessions(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestVADAudioStreamBargeInDeadlockFree(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_vad_bargein_deadlock")
+	defer session.Close()
+
+	// 1. User speaks
+	for i := 0; i < 3; i++ {
+		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
+	}
+	time.Sleep(360 * time.Millisecond) // Silence hangover triggers thinking
+	_ = session.IngestAudio(&model.AudioFrame{Energy: 0.001, IsVoiced: false})
+
+	// 2. Stream tokens to enter speaking state
+	tokens := make(chan string, 5)
+	tokens <- "Hello, "
+	tokens <- "I can help you with your reservation today. "
+	close(tokens)
+	session.StartLLMResponseStream(tokens)
+
+	// Wait for audio
+	select {
+	case <-session.AudioOut():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timeout waiting for audio chunk")
+	}
+
+	if session.State() != model.StateSpeaking {
+		t.Fatalf("expected state SPEAKING, got %s", session.State())
+	}
+
+	// 3. User interrupts by sending voiced audio frames (triggering VAD barge-in inside ProcessFrame)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Send 2 consecutive voiced frames to trigger OnBargeIn from within ProcessFrame
+		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.08, IsVoiced: true})
+		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.08, IsVoiced: true})
+	}()
+
+	select {
+	case <-done:
+		// Success: no deadlock!
+	case <-time.After(1 * time.Second):
+		t.Fatalf("DEADLOCK DETECTED: IngestAudio hung while triggering VAD barge-in")
+	}
+
+	if session.State() != model.StateListening {
+		t.Errorf("expected state LISTENING after audio barge-in, got %s", session.State())
+	}
+}

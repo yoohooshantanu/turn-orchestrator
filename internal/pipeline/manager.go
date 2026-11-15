@@ -80,7 +80,7 @@ func (sm *SessionManager) cleanupLoop() {
 			if len(sm.sessions) > 10000 {
 				count := 0
 				for id, s := range sm.sessions {
-					if s.isClosed {
+					if s.IsClosed() {
 						delete(sm.sessions, id)
 						count++
 						if count >= 2000 {

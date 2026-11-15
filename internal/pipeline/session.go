@@ -84,12 +84,31 @@ func (s *VoiceSession) State() model.ConversationState {
 	return s.fsm.Current()
 }
 
+func (s *VoiceSession) IsClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isClosed
+}
+
 func (s *VoiceSession) AudioOut() <-chan *model.AudioChunk {
 	return s.audioOut
 }
 
 func (s *VoiceSession) EventOut() <-chan *model.TurnEvent {
 	return s.eventOut
+}
+
+func (s *VoiceSession) GetTurnMetrics(turnID string) (*model.TurnMetrics, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.turnHistory[turnID]
+	return m, ok
+}
+
+func (s *VoiceSession) GetActiveTurnMetrics() *model.TurnMetrics {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activeTurnMetrics
 }
 
 // IngestAudio processes incoming telephony audio frames through VAD
@@ -135,6 +154,14 @@ func (s *VoiceSession) handleUserSpeechEnd(silenceDetectedAt time.Time, speechDu
 		UserSilenceDetectedAt: silenceDetectedAt,
 	}
 	s.activeTurnMetrics = turnMetrics
+
+	// Cap turnHistory to 100 entries to prevent memory accumulation in prolonged calls
+	if len(s.turnHistory) >= 100 {
+		for k := range s.turnHistory {
+			delete(s.turnHistory, k)
+			break
+		}
+	}
 	s.turnHistory[turnID] = turnMetrics
 	s.mu.Unlock()
 
@@ -270,6 +297,8 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 
 	select {
 	case <-ctx.Done():
+		return
+	case <-s.stopCh:
 		return
 	case s.audioOut <- audioChunk:
 		metrics.DefaultMetrics.IncFrame()
