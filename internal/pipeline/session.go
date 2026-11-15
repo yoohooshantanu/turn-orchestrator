@@ -427,22 +427,26 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		return
 	}
 
-	// Simulated neural TTS synthesis latency (15ms for first chunk, 35ms for rest)
-	delay := 35 * time.Millisecond
-	if chunk.IsFirstChunk {
-		delay = 15 * time.Millisecond
-	}
-
-	select {
-	case <-time.After(delay):
-	case <-ctx.Done():
+	// Thread-safe read of configured TTS provider under mutex read lock
+	s.mu.RLock()
+	tts := s.ttsProvider
+	s.mu.RUnlock()
+	if tts == nil {
 		return
 	}
 
+	// Synthesize real audio bytes from TTS provider (incorporating genuine synthesis and network latency)
+	audioBytes, err := tts.SynthesizeChunk(ctx, chunk.Text, chunk.Index)
+	if err != nil || len(audioBytes) == 0 {
+		return
+	}
+
+	// Guard against stale turn generation or barge-in interruption while synthesis was in flight
 	if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 		return
 	}
 
+	// Record accurate Time-to-First-Audio (TTFA) upon arrival of actual synthesized audio bytes
 	s.mu.Lock()
 	if s.activeTurnMetrics != nil && s.activeTurnMetrics.FirstAudioReadyAt.IsZero() {
 		now := time.Now()
@@ -459,22 +463,9 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 	}
 	s.mu.Unlock()
 
-	// Advance FSM to Speaking state upon initial audio availability
+	// Advance FSM to Speaking state upon genuine audio arrival
 	if s.fsm.Is(model.StateThinking) {
 		_ = s.fsm.Transition(model.StateSpeaking)
-	}
-
-	// Thread-safe read of configured TTS provider under mutex read lock
-	s.mu.RLock()
-	tts := s.ttsProvider
-	s.mu.RUnlock()
-	if tts == nil {
-		return
-	}
-
-	audioBytes, err := tts.SynthesizeChunk(ctx, chunk.Text, chunk.Index)
-	if err != nil || len(audioBytes) == 0 {
-		return
 	}
 
 	audioChunk := &model.AudioChunk{

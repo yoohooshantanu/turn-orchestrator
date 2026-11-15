@@ -84,25 +84,23 @@
 VocalFlow decouples turn orchestration from speech synthesis providers via the `StreamingTTSProvider` interface:
 
 1. **Cartesia Sonic WebSocket Streaming Adapter (`CartesiaStreamingTTS`)**:
-   - Production WebSocket streaming client connecting to `wss://api.cartesia.ai/tts/websocket`.
+   - Production WebSocket streaming client connecting to `wss://api.cartesia.ai/tts/websocket?cartesia_version=2024-06-10`.
    - Sends structured chunk request frames (`model_id`, `transcript`, `voice.id`, `output_format.container="raw", encoding="pcm_s16le", sample_rate=16000`).
-   - Streams incoming binary linear PCM frames directly into the outbound session buffer.
-   - **Resilient Fallback**: If `CARTESIA_API_KEY` is unset or if transient network failure occurs, the adapter automatically falls back to mathematical linear PCM formant synthesis, ensuring telephony calls never drop audio.
-2. **ElevenLabs WebSocket Streaming Adapter (`ElevenLabsStreamingTTS`)**:
-   - Streams neural voice synthesis using ElevenLabs Turbo v2.5 input streaming protocol with voice similarity and latency optimization schedules.
-3. **Acoustic Test Harness Waveform Synthesizer (`FormantTestHarnessTTS`)**:
+   - Streams incoming binary linear PCM frames and JSON base64 frames until completion (`type: "done"`).
+   - In production with `CARTESIA_API_KEY` configured, connection and API errors explicitly surface structured failures rather than masking errors.
+2. **Acoustic Test Harness Waveform Synthesizer (`FormantTestHarnessTTS`)**:
    - Generates a synthetic 16kHz 16-bit linear PCM acoustic test waveform ($F_0=150\text{Hz}, F_1=500\text{Hz}, F_2=1500\text{Hz}$) with measurable RMS acoustic energy.
    - Provides deterministic, offline verification of audio buffering, VAD, and barge-in scheduling without cloud API keys, network jitter, or third-party usage costs.
+   - Automatically used when `CARTESIA_API_KEY` is unconfigured.
 
 ### Environment Configuration
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `TTS_PROVIDER` | `formant` | Active TTS provider (`cartesia`, `elevenlabs`, `formant`) |
+| `TTS_PROVIDER` | `formant` | Active TTS provider (`cartesia`, `formant`) |
 | `CARTESIA_API_KEY` | `""` | Cartesia Sonic API key (falls back to test harness if empty) |
 | `CARTESIA_MODEL_ID` | `sonic-english` | Cartesia voice model ID |
 | `CARTESIA_VOICE_ID` | `a0e998e3-182d-4d96-8d1a-0e624b66ffc2` | Cartesia voice identifier |
-| `ELEVENLABS_API_KEY` | `""` | ElevenLabs streaming API key |
 | `REQUIRE_AUTH` | `false` | When `true`, enforces fail-closed Bearer token authentication |
 | `AUTH_TOKEN` | `""` | Expected secret Bearer token for HTTP & WebSocket clients |
 
