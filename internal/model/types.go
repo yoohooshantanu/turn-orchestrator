@@ -34,6 +34,7 @@ const (
 	EventBargeInTriggered EventType = "BARGE_IN_TRIGGERED"
 	EventPlaybackFinished EventType = "PLAYBACK_FINISHED"
 	EventTurnCompleted    EventType = "TURN_COMPLETED"
+	EventStreamError      EventType = "STREAM_ERROR"
 )
 
 type TurnEvent struct {

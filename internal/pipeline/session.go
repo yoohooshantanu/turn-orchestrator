@@ -154,6 +154,15 @@ func (s *VoiceSession) GetActiveTurnMetrics() *model.TurnMetrics {
 	return s.activeTurnMetrics
 }
 
+// SetActiveTurnSilenceDetectedAt configures user silence detection timestamp for synthetic benchmark or test turns
+func (s *VoiceSession) SetActiveTurnSilenceDetectedAt(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeTurnMetrics != nil {
+		s.activeTurnMetrics.UserSilenceDetectedAt = t
+	}
+}
+
 // MarkDetached flags the session as disconnected while preserving conversation state during grace window
 func (s *VoiceSession) MarkDetached() {
 	s.mu.Lock()
@@ -305,8 +314,9 @@ func (s *VoiceSession) StartSpeakingTurnForBench() {
 	s.activeTurnCtx = turnCtx
 	s.activeTurnCancel = cancel
 	s.activeTurnMetrics = &model.TurnMetrics{
-		SessionID: s.sessionID,
-		TurnID:    turnID,
+		SessionID:             s.sessionID,
+		TurnID:                turnID,
+		UserSilenceDetectedAt: time.Now(),
 	}
 
 	// Pre-fill audio buffer with speech chunks
@@ -529,6 +539,33 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 
 	if err != nil && ctx.Err() == nil {
 		logger.L.Error("streaming_synthesis_failed", "session_id", s.sessionID, "turn_id", chunk.TurnID, "error", err)
+
+		// Session-level mid-turn error handling: invalidate turn, drain output audio, reset to listening
+		s.mu.Lock()
+		atomic.AddUint64(&s.turnGen, 1)
+		if s.activeTurnCancel != nil {
+			s.activeTurnCancel()
+			s.activeTurnCancel = nil
+		}
+	DrainErrorLoop:
+		for {
+			select {
+			case <-s.audioOut:
+			default:
+				break DrainErrorLoop
+			}
+		}
+		s.mu.Unlock()
+
+		_ = s.fsm.Transition(model.StateListening)
+
+		s.emitEvent(&model.TurnEvent{
+			Type:      model.EventStreamError,
+			SessionID: s.sessionID,
+			TurnID:    chunk.TurnID,
+			Payload:   err.Error(),
+			Timestamp: time.Now().UnixMilli(),
+		})
 	}
 }
 
@@ -622,7 +659,23 @@ func (s *VoiceSession) FinishPlayback() {
 	s.vad.Reset()
 }
 
+// AddEventListener registers an external callback for conversational turn events
+func (s *VoiceSession) AddEventListener(listener EventListener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventListeners = append(s.eventListeners, listener)
+}
+
 func (s *VoiceSession) emitEvent(evt *model.TurnEvent) {
+	s.mu.RLock()
+	listeners := make([]EventListener, len(s.eventListeners))
+	copy(listeners, s.eventListeners)
+	s.mu.RUnlock()
+
+	for _, l := range listeners {
+		l(evt)
+	}
+
 	select {
 	case <-s.stopCh:
 		return

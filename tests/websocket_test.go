@@ -3,14 +3,17 @@ package tests
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/yoohooshantanu/vocalflow/internal/model"
 	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
@@ -497,8 +500,11 @@ func TestTimeToFirstAudioMeasurementWithDelayedProvider(t *testing.T) {
 	delayedTTS := &MockDelayedTTS{delay: 40 * time.Millisecond}
 	session.SetTTSProvider(delayedTTS)
 
-	// Advance session into speaking turn
+	// Advance session into speaking turn with known user silence detection timestamp
 	session.StartSpeakingTurnForBench()
+	silenceDetected := time.Now()
+	session.SetActiveTurnSilenceDetectedAt(silenceDetected)
+
 DrainInitial:
 	for {
 		select {
@@ -522,6 +528,211 @@ DrainInitial:
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("timeout waiting for delayed synthesized audio frame")
+	}
+
+	metrics := session.GetActiveTurnMetrics()
+	if metrics == nil {
+		t.Fatalf("expected non-nil active turn metrics")
+	}
+	if metrics.FirstAudioReadyAt.IsZero() {
+		t.Errorf("expected FirstAudioReadyAt timestamp to be recorded")
+	}
+	if metrics.TTFA < 40*time.Millisecond {
+		t.Errorf("expected TTFA >= 40ms with delayed provider, got %v", metrics.TTFA)
+	}
+	if metrics.TTFA > 350*time.Millisecond {
+		t.Errorf("expected TTFA within reasonable bound <= 350ms, got %v", metrics.TTFA)
+	}
+}
+
+// MockIncrementalTTS provides controlled stepwise emission of audio frames
+type MockIncrementalTTS struct {
+	frame1Ready chan struct{}
+	frame2Gate  chan struct{}
+}
+
+func (m *MockIncrementalTTS) SynthesizeChunk(ctx context.Context, text string, chunkIndex int) ([]byte, error) {
+	return pipeline.GenerateFormantAudioPCM(0), nil
+}
+
+func (m *MockIncrementalTTS) SynthesizeStream(ctx context.Context, text string, chunkIndex int, callback pipeline.AudioChunkHandler) error {
+	// Frame 1 emitted immediately
+	f1 := pipeline.GenerateFormantAudioPCM(0)
+	if err := callback(f1); err != nil {
+		return err
+	}
+	close(m.frame1Ready) // Notify that frame 1 was yielded to pipeline
+
+	// Wait until test confirms client received frame 1 over WebSocket before synthesizing frame 2
+	select {
+	case <-m.frame2Gate:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// Frame 2 emitted only after client has acknowledged frame 1
+	f2 := pipeline.GenerateFormantAudioPCM(320)
+	return callback(f2)
+}
+
+func (m *MockIncrementalTTS) Close() error {
+	return nil
+}
+
+func TestWebSocketIncrementalTTSStreamingPipeline(t *testing.T) {
+	mgr := pipeline.NewSessionManager(5 * time.Minute)
+	defer mgr.Stop()
+
+	handler := server.NewServerHandler(mgr)
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	sessionID := "sess_incremental_ws_" + uuid.NewString()[:8]
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/voice/" + sessionID
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed connecting websocket: %v", err)
+	}
+	defer conn.Close()
+
+	session := mgr.GetOrCreate(sessionID)
+
+	mockIncremental := &MockIncrementalTTS{
+		frame1Ready: make(chan struct{}),
+		frame2Gate:  make(chan struct{}),
+	}
+	session.SetTTSProvider(mockIncremental)
+
+	// Initiate turn with sentence text
+	tokenCh := make(chan string, 1)
+	session.StartSpeakingTurnForBench()
+DrainInitial:
+	for {
+		select {
+		case <-session.AudioOut():
+		default:
+			break DrainInitial
+		}
+	}
+
+	session.StartLLMResponseStream(tokenCh)
+	tokenCh <- "First streaming sentence."
+	close(tokenCh)
+
+	// Wait until provider yields frame 1
+	select {
+	case <-mockIncremental.frame1Ready:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for provider to yield frame 1")
+	}
+
+	// WebSocket client MUST receive frame 1 over the network while frame 2 has NOT yet been synthesized!
+	var f1Received bool
+	for i := 0; i < 5; i++ {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("error reading from websocket: %v", err)
+		}
+		if msgType == websocket.BinaryMessage && len(data) == 640 {
+			f1Received = true
+			break
+		}
+	}
+	if !f1Received {
+		t.Fatalf("client did not receive binary frame 1 before frame 2 was gated")
+	}
+
+	// Now release gate to synthesize frame 2
+	close(mockIncremental.frame2Gate)
+
+	// Client MUST receive frame 2 incrementally
+	var f2Received bool
+	for i := 0; i < 5; i++ {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("error reading frame 2 from websocket: %v", err)
+		}
+		if msgType == websocket.BinaryMessage && len(data) == 640 {
+			f2Received = true
+			break
+		}
+	}
+	if !f2Received {
+		t.Fatalf("client did not receive binary frame 2 incrementally")
+	}
+}
+
+type MockFailingTTS struct{}
+
+func (m *MockFailingTTS) SynthesizeChunk(ctx context.Context, text string, chunkIndex int) ([]byte, error) {
+	return nil, fmt.Errorf("simulated synthesis provider error")
+}
+
+func (m *MockFailingTTS) SynthesizeStream(ctx context.Context, text string, chunkIndex int, callback pipeline.AudioChunkHandler) error {
+	// Emit 1 frame then fail mid-stream
+	_ = callback(pipeline.GenerateFormantAudioPCM(0))
+	return fmt.Errorf("cartesia upstream connection dropped")
+}
+
+func (m *MockFailingTTS) Close() error {
+	return nil
+}
+
+func TestStreamFailureMidTurnRecovery(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_stream_fail_test")
+	defer session.Close()
+
+	session.SetTTSProvider(&MockFailingTTS{})
+
+	var receivedErrorEvent *model.TurnEvent
+	var eventMu sync.Mutex
+	session.AddEventListener(func(event *model.TurnEvent) {
+		if event.Type == model.EventStreamError {
+			eventMu.Lock()
+			receivedErrorEvent = event
+			eventMu.Unlock()
+		}
+	})
+
+	session.StartSpeakingTurnForBench()
+DrainInitial:
+	for {
+		select {
+		case <-session.AudioOut():
+		default:
+			break DrainInitial
+		}
+	}
+
+	tokenCh := make(chan string, 1)
+	session.StartLLMResponseStream(tokenCh)
+	tokenCh <- "This stream will fail mid turn."
+	close(tokenCh)
+
+	// Wait for synthesis to trigger error handling
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		eventMu.Lock()
+		got := receivedErrorEvent != nil
+		eventMu.Unlock()
+		if got && session.State() == model.StateListening {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	eventMu.Lock()
+	defer eventMu.Unlock()
+	if receivedErrorEvent == nil {
+		t.Fatalf("expected EventStreamError to be emitted upon mid-turn failure")
+	}
+	if !strings.Contains(receivedErrorEvent.Payload, "cartesia upstream connection dropped") {
+		t.Errorf("expected error payload in event, got %q", receivedErrorEvent.Payload)
+	}
+
+	if session.State() != model.StateListening {
+		t.Errorf("expected FSM to recover to StateListening after stream failure, got %s", session.State())
 	}
 }
 
