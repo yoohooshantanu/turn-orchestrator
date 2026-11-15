@@ -81,13 +81,30 @@
 
 ## Audio Synthesis & Streaming TTS Architecture
 
-VocalFlow decouples turn orchestration from external cloud speech providers via the `StreamingTTSProvider` interface:
+VocalFlow decouples turn orchestration from speech synthesis providers via the `StreamingTTSProvider` interface:
 
-1. **Acoustic Test Harness Waveform Synthesizer (`FormantTestHarnessTTS`)**:
+1. **Cartesia Sonic WebSocket Streaming Adapter (`CartesiaStreamingTTS`)**:
+   - Production WebSocket streaming client connecting to `wss://api.cartesia.ai/tts/websocket`.
+   - Sends structured chunk request frames (`model_id`, `transcript`, `voice.id`, `output_format.container="raw", encoding="pcm_s16le", sample_rate=16000`).
+   - Streams incoming binary linear PCM frames directly into the outbound session buffer.
+   - **Resilient Fallback**: If `CARTESIA_API_KEY` is unset or if transient network failure occurs, the adapter automatically falls back to mathematical linear PCM formant synthesis, ensuring telephony calls never drop audio.
+2. **ElevenLabs WebSocket Streaming Adapter (`ElevenLabsStreamingTTS`)**:
+   - Streams neural voice synthesis using ElevenLabs Turbo v2.5 input streaming protocol with voice similarity and latency optimization schedules.
+3. **Acoustic Test Harness Waveform Synthesizer (`FormantTestHarnessTTS`)**:
    - Generates a synthetic 16kHz 16-bit linear PCM acoustic test waveform ($F_0=150\text{Hz}, F_1=500\text{Hz}, F_2=1500\text{Hz}$) with measurable RMS acoustic energy.
    - Provides deterministic, offline verification of audio buffering, VAD, and barge-in scheduling without cloud API keys, network jitter, or third-party usage costs.
-2. **Production Cloud TTS Adapters (`StreamingTTSProvider`)**:
-   - Pluggable streaming synthesis interface (`CartesiaStreamingTTS` / `ElevenLabsStreamingTTS`) for cloud WebSocket streaming neural speech synthesis.
+
+### Environment Configuration
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TTS_PROVIDER` | `formant` | Active TTS provider (`cartesia`, `elevenlabs`, `formant`) |
+| `CARTESIA_API_KEY` | `""` | Cartesia Sonic API key (falls back to test harness if empty) |
+| `CARTESIA_MODEL_ID` | `sonic-english` | Cartesia voice model ID |
+| `CARTESIA_VOICE_ID` | `a0e998e3-182d-4d96-8d1a-0e624b66ffc2` | Cartesia voice identifier |
+| `ELEVENLABS_API_KEY` | `""` | ElevenLabs streaming API key |
+| `REQUIRE_AUTH` | `false` | When `true`, enforces fail-closed Bearer token authentication |
+| `AUTH_TOKEN` | `""` | Expected secret Bearer token for HTTP & WebSocket clients |
 
 ---
 
@@ -105,7 +122,7 @@ VocalFlow decouples turn orchestration from external cloud speech providers via 
 
 ## Verification & Testing
 
-Run all unit, integration, and concurrency tests:
+Run all 17 unit, integration, and concurrency tests:
 
 ```bash
 $env:CGO_ENABLED="0"; $env:GOPROXY="off"; $env:GOTOOLCHAIN="local"

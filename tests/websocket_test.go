@@ -288,3 +288,99 @@ func TestWebSocketFullDuplexLiveAudio(t *testing.T) {
 	// 5. Send playback finished
 	_ = conn.WriteJSON(map[string]string{"type": "playback_finished"})
 }
+
+func TestCartesiaProviderLifecycleAndFallback(t *testing.T) {
+	// 1. Fallback when API key is unconfigured
+	fallbackProvider := pipeline.NewCartesiaStreamingTTS("", "sonic-english", "voice-default")
+	pcm, err := fallbackProvider.SynthesizeChunk(context.Background(), "Hello Cartesia", 0)
+	if err != nil {
+		t.Fatalf("expected fallback synthesis to succeed without error, got %v", err)
+	}
+	if len(pcm) != 640 {
+		t.Errorf("expected 640 bytes of fallback PCM audio, got %d", len(pcm))
+	}
+
+	// 2. Cancellation handling
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = fallbackProvider.SynthesizeChunk(canceledCtx, "Should cancel", 1)
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled error, got %v", err)
+	}
+
+	// 3. Provider closure lifecycle
+	if err := fallbackProvider.Close(); err != nil {
+		t.Errorf("expected clean provider close, got %v", err)
+	}
+	_, err = fallbackProvider.SynthesizeChunk(context.Background(), "After close", 2)
+	if err == nil {
+		t.Errorf("expected error when synthesizing with closed provider")
+	}
+
+	// 4. Live streaming with mock Cartesia WebSocket server
+	upgrader := websocket.Upgrader{}
+	expectedAudio := pipeline.GenerateFormantAudioPCM(500)
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify auth headers
+		if r.Header.Get("X-API-Key") != "test-cartesia-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Read request frame
+		var req map[string]interface{}
+		if err := conn.ReadJSON(&req); err != nil {
+			return
+		}
+
+		// Reply with streaming binary PCM frame
+		_ = conn.WriteMessage(websocket.BinaryMessage, expectedAudio)
+	}))
+	defer mockServer.Close()
+
+	liveCartesia := pipeline.NewCartesiaStreamingTTS("test-cartesia-key", "sonic-english", "test-voice")
+	liveCartesia.SetEndpoint(mockServer.URL)
+
+	audio, err := liveCartesia.SynthesizeChunk(context.Background(), "Live Cartesia stream", 0)
+	if err != nil {
+		t.Fatalf("expected successful synthesis from mock Cartesia, got %v", err)
+	}
+	if len(audio) != len(expectedAudio) {
+		t.Errorf("expected %d bytes from Cartesia, got %d", len(expectedAudio), len(audio))
+	}
+}
+
+func TestTTSProviderEnvironmentConfiguration(t *testing.T) {
+	// Test default fallback
+	os.Setenv("TTS_PROVIDER", "")
+	pDefault := pipeline.NewTTSProviderFromEnv()
+	if _, ok := pDefault.(*pipeline.FormantTestHarnessTTS); !ok {
+		t.Errorf("expected FormantTestHarnessTTS as default")
+	}
+
+	// Test Cartesia config
+	os.Setenv("TTS_PROVIDER", "cartesia")
+	os.Setenv("CARTESIA_API_KEY", "cartesia-key-123")
+	pCartesia := pipeline.NewTTSProviderFromEnv()
+	if _, ok := pCartesia.(*pipeline.CartesiaStreamingTTS); !ok {
+		t.Errorf("expected CartesiaStreamingTTS when TTS_PROVIDER=cartesia")
+	}
+
+	// Test ElevenLabs config
+	os.Setenv("TTS_PROVIDER", "elevenlabs")
+	os.Setenv("ELEVENLABS_API_KEY", "eleven-key-123")
+	pEleven := pipeline.NewTTSProviderFromEnv()
+	if _, ok := pEleven.(*pipeline.ElevenLabsStreamingTTS); !ok {
+		t.Errorf("expected ElevenLabsStreamingTTS when TTS_PROVIDER=elevenlabs")
+	}
+
+	os.Unsetenv("TTS_PROVIDER")
+	os.Unsetenv("CARTESIA_API_KEY")
+	os.Unsetenv("ELEVENLABS_API_KEY")
+}

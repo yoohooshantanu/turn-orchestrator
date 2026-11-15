@@ -7,13 +7,17 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/logger"
 )
 
+// TTSProviderFactory constructs a new streaming TTS provider instance for a session
+type TTSProviderFactory func() StreamingTTSProvider
+
 // SessionManager maintains multi-tenant active voice conversation sessions
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[string]*VoiceSession
-	ttl      time.Duration
-	stopCh   chan struct{}
-	stopOnce sync.Once
+	mu         sync.RWMutex
+	sessions   map[string]*VoiceSession
+	ttl        time.Duration
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	ttsFactory TTSProviderFactory
 }
 
 func NewSessionManager(ttl time.Duration) *SessionManager {
@@ -31,6 +35,13 @@ func NewSessionManager(ttl time.Duration) *SessionManager {
 	return sm
 }
 
+// SetTTSFactory configures the factory used to instantiate TTS providers on new sessions
+func (sm *SessionManager) SetTTSFactory(factory TTSProviderFactory) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.ttsFactory = factory
+}
+
 func (sm *SessionManager) GetOrCreate(sessionID string) *VoiceSession {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -38,6 +49,9 @@ func (sm *SessionManager) GetOrCreate(sessionID string) *VoiceSession {
 	s, ok := sm.sessions[sessionID]
 	if !ok {
 		s = NewVoiceSession(sessionID)
+		if sm.ttsFactory != nil {
+			s.SetTTSProvider(sm.ttsFactory())
+		}
 		sm.sessions[sessionID] = s
 	}
 	return s

@@ -25,6 +25,9 @@ func main() {
 	logger.L.Info("starting_vocalflow_engine", "port", port)
 
 	mgr := pipeline.NewSessionManager(30 * time.Minute)
+	mgr.SetTTSFactory(func() pipeline.StreamingTTSProvider {
+		return pipeline.NewTTSProviderFromEnv()
+	})
 	handler := server.NewServerHandler(mgr)
 
 	httpServer := &http.Server{
