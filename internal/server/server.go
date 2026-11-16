@@ -19,6 +19,43 @@ import (
 	"github.com/yoohooshantanu/vocalflow/internal/vad"
 )
 
+// WSWriter defines the subset of websocket write methods used by the emitter
+type WSWriter interface {
+	WriteMessage(messageType int, data []byte) error
+	WriteJSON(v interface{}) error
+}
+
+// RunEmitter streams binary audio frames and control events to the client.
+func RunEmitter(ctx context.Context, session *pipeline.VoiceSession, writer WSWriter) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case chunk, ok := <-session.AudioOut():
+			if !ok {
+				return nil
+			}
+			// Drop mismatched/stale turn generations at send time:
+			// Invariant: after TriggerBargeIn returns, no frame from a superseded turn is delivered over WebSocket.
+			if chunk.Generation != session.TurnGeneration() {
+				continue
+			}
+			// Transmit raw PCM audio chunk bytes directly to client
+			if err := writer.WriteMessage(websocket.BinaryMessage, chunk.Data); err != nil {
+				return err
+			}
+
+		case evt, ok := <-session.EventOut():
+			if !ok {
+				return nil
+			}
+			if err := writer.WriteJSON(evt); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // checkAuth enforces fail-closed Bearer token authentication.
 // Query-string tokens are explicitly rejected to prevent token leakage in proxy logs and browser histories.
 // In production (ENV=production or REQUIRE_AUTH=true), missing AUTH_TOKEN configuration fails closed.
@@ -150,28 +187,7 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 
 		// Emitter loop: Push binary audio frames and control events to telephony client
 		go func() {
-			for {
-				select {
-				case <-clientCtx.Done():
-					return
-				case chunk, ok := <-session.AudioOut():
-					if !ok {
-						return
-					}
-					// Transmit raw PCM audio chunk bytes directly to client
-					if err := conn.WriteMessage(websocket.BinaryMessage, chunk.Data); err != nil {
-						return
-					}
-
-				case evt, ok := <-session.EventOut():
-					if !ok {
-						return
-					}
-					if err := conn.WriteJSON(evt); err != nil {
-						return
-					}
-				}
-			}
+			_ = RunEmitter(clientCtx, session, conn)
 		}()
 
 		// Ingestion loop: Receive raw PCM binary audio or control frames from telephony client

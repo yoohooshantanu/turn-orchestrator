@@ -2,13 +2,21 @@ package tests
 
 import (
 	"crypto/rand"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/yoohooshantanu/vocalflow/internal/chunker"
+	"github.com/yoohooshantanu/vocalflow/internal/logger"
 	"github.com/yoohooshantanu/vocalflow/internal/model"
 	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
 	"github.com/yoohooshantanu/vocalflow/internal/vad"
 )
+
+func init() {
+	// Silence verbose logger output during benchmarks
+	logger.L = slog.New(slog.NewJSONHandler(io.Discard, nil))
+}
 
 func BenchmarkRMSEnergyCalculation(b *testing.B) {
 	// Standard 20ms audio frame at 16kHz 16-bit mono = 640 bytes
@@ -23,7 +31,7 @@ func BenchmarkRMSEnergyCalculation(b *testing.B) {
 
 func BenchmarkSentenceChunker(b *testing.B) {
 	tokens := []string{
-		"Thank", " you", " for", " calling", " Callease", " support", ". ",
+		"Thank", " you", " for", " calling", " Cloud", " support", ". ",
 		"How", " may", " I", " assist", " you", " today", "?",
 	}
 
@@ -45,6 +53,20 @@ func BenchmarkBargeInCancellationLatency(b *testing.B) {
 		sess.StartSpeakingTurnForBench()
 		sess.TriggerBargeIn()
 		sess.Close()
+	}
+}
+
+// BenchmarkTriggerBargeInDirect isolates pure in-process cancellation latency (mutex acquisition,
+// context cancellation, atomic generation increment, output queue drain, and FSM transition)
+// from session allocation and teardown overhead.
+func BenchmarkTriggerBargeInDirect(b *testing.B) {
+	sess := pipeline.NewVoiceSession("sess_bench_direct")
+	defer sess.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sess.StartSpeakingTurnForBench()
+		sess.TriggerBargeIn()
 	}
 }
 

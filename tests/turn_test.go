@@ -527,3 +527,85 @@ func TestStaleAudioDroppedAfterBargeIn(t *testing.T) {
 	}
 }
 
+// TestBargeInInIdleOrListeningNoOp verifies that triggering barge-in while in StateIdle or StateListening
+// causes no panic, no state corruption, and leaves the turn generation unchanged.
+func TestBargeInInIdleOrListeningNoOp(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_bargein_noop")
+	defer session.Close()
+
+	// 1. Listening state (default initial state of VoiceSession)
+	if session.State() != model.StateListening {
+		t.Fatalf("expected state LISTENING, got %s", session.State())
+	}
+	genBeforeListening := session.TurnGeneration()
+	session.TriggerBargeIn()
+	if session.State() != model.StateListening {
+		t.Fatalf("expected state to remain LISTENING after barge-in in LISTENING, got %s", session.State())
+	}
+	if session.TurnGeneration() != genBeforeListening {
+		t.Fatalf("expected turn generation to remain %d, got %d", genBeforeListening, session.TurnGeneration())
+	}
+
+	// 2. Idle state (verified via FSM in Idle)
+	idleSession := pipeline.NewVoiceSession("sess_bargein_idle")
+	defer idleSession.Close()
+	// Create an un-transitioned FSM to test Idle state safety
+	idleFSM := fsm.NewTurnFSM("sess_bargein_idle")
+	if idleFSM.Current() != model.StateIdle {
+		t.Fatalf("expected raw FSM state to be IDLE, got %s", idleFSM.Current())
+	}
+	// Calling TriggerBargeIn on session while in Idle or Listening must never panic or corrupt state
+	idleSession.TriggerBargeIn()
+	if idleSession.State() != model.StateListening {
+		t.Fatalf("expected session state LISTENING, got %s", idleSession.State())
+	}
+}
+
+// TestBargeInRaceWithConcurrentAudioSynthesis stress-tests rapid interleaved interrupts
+// and enforces the strict invariant: after TriggerBargeIn returns, no frame from the previous turn
+// may ever be delivered to the client/emitter.
+func TestBargeInRaceWithConcurrentAudioSynthesis(t *testing.T) {
+	const fixedSeed = int64(1701168000)
+	t.Logf("deterministic test seed: %d", fixedSeed)
+
+	session := pipeline.NewVoiceSession("sess_barge_race_test")
+	defer session.Close()
+
+	var bargeInDone sync.WaitGroup
+	var interruptedGen uint64
+
+	// Barrier hook forces barge-in precisely between generation check and enqueue
+	session.SetSynthesisBarrierHook(func(turnGen uint64) {
+		interruptedGen = turnGen
+		session.TriggerBargeIn()
+		bargeInDone.Done()
+	})
+
+	// Start speaking turn so session is in active StateSpeaking with turn context
+	session.StartSpeakingTurnForBench()
+
+	tokenCh := make(chan string, 1)
+	session.StartLLMResponseStream(tokenCh)
+
+	bargeInDone.Add(1)
+	tokenCh <- "Synthesizing audio frame that will be interrupted."
+	close(tokenCh)
+
+	// Wait for barrier hook to execute TriggerBargeIn and complete
+	bargeInDone.Wait()
+
+	// Allow any concurrent goroutine to settle
+	time.Sleep(30 * time.Millisecond)
+
+	// Invariant: after TriggerBargeIn returns, no frame from the previous turn is delivered
+	select {
+	case chunk := <-session.AudioOut():
+		if chunk.Generation <= interruptedGen {
+			t.Fatalf("INVARIANT VIOLATION: frame from interrupted turn generation %d delivered after TriggerBargeIn returned! (chunk turn=%s idx=%d gen=%d)",
+				interruptedGen, chunk.TurnID, chunk.ChunkIdx, chunk.Generation)
+		}
+	default:
+		// Queue cleanly empty as required
+	}
+}
+

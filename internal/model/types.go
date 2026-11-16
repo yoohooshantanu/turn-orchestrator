@@ -65,12 +65,13 @@ type SentenceChunk struct {
 }
 
 type AudioChunk struct {
-	SessionID string `json:"session_id"`
-	TurnID    string `json:"turn_id"`
-	ChunkIdx  int    `json:"chunk_idx"`
-	Data      []byte `json:"data"`
-	DurationMs int64 `json:"duration_ms"`
-	Timestamp int64  `json:"timestamp"`
+	SessionID  string `json:"session_id"`
+	TurnID     string `json:"turn_id"`
+	ChunkIdx   int    `json:"chunk_idx"`
+	Generation uint64 `json:"generation"`
+	Data       []byte `json:"data"`
+	DurationMs int64  `json:"duration_ms"`
+	Timestamp  int64  `json:"timestamp"`
 }
 
 // TurnMetrics tracks turn-level latency and performance benchmarks.

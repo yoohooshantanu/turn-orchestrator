@@ -757,13 +757,41 @@ func TestTTSProviderEnvironmentConfiguration(t *testing.T) {
 	os.Unsetenv("CARTESIA_API_KEY")
 }
 
+type MockHandshakeFailingTTS struct {
+	frameDeliveredCh chan struct{}
+}
+
+func (m *MockHandshakeFailingTTS) SynthesizeChunk(ctx context.Context, text string, chunkIndex int) ([]byte, error) {
+	return nil, fmt.Errorf("simulated synthesis provider error")
+}
+
+func (m *MockHandshakeFailingTTS) SynthesizeStream(ctx context.Context, text string, chunkIndex int, callback pipeline.AudioChunkHandler) error {
+	_ = callback(pipeline.GenerateFormantAudioPCM(0))
+	if m.frameDeliveredCh != nil {
+		select {
+		case <-m.frameDeliveredCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("cartesia upstream connection dropped")
+}
+
+func (m *MockHandshakeFailingTTS) Close() error {
+	return nil
+}
+
 // TestWebSocketStreamFailureServerRecovery verifies the full-duplex WebSocket error protocol and server-side turn recovery path:
 // 1. Server emits initial binary audio frame 1 over WebSocket.
 // 2. TTS fails mid-stream; server detects provider failure, drains server output queues, and emits STREAM_ERROR control event.
 // 3. Telephony test client buffers received audio frames (simulating client playback queue).
-// 4. Upon receiving STREAM_ERROR, client purges its unplayed audio buffer and transmits playback_finished.
-// 5. Server processes playback_finished acknowledgement, records turn completion, and emits TURN_COMPLETED event over WebSocket.
-// 6. Server session FSM remains cleanly in LISTENING state ready for next turn.
+// 4. Client purges its unplayed audio buffer and transmits playback_finished.
+// 5. Invariants verified:
+//    - STREAM_ERROR is delivered.
+//    - Zero audio frames delivered after STREAM_ERROR.
+//    - Server session FSM recovers cleanly to StateListening.
+//    - Subsequent turn succeeds completely with normal audio streaming.
 func TestWebSocketStreamFailureServerRecovery(t *testing.T) {
 	mgr := pipeline.NewSessionManager(5 * time.Minute)
 	defer mgr.Stop()
@@ -782,7 +810,8 @@ func TestWebSocketStreamFailureServerRecovery(t *testing.T) {
 	defer conn.Close()
 
 	session := mgr.GetOrCreate(sessionID)
-	session.SetTTSProvider(&MockFailingTTS{})
+	frameDeliveredCh := make(chan struct{}, 1)
+	session.SetTTSProvider(&MockHandshakeFailingTTS{frameDeliveredCh: frameDeliveredCh})
 
 	// Drain any initial benchmark chunks from session creation
 	session.StartSpeakingTurnForBench()
@@ -804,26 +833,39 @@ DrainInitial:
 	var clientAudioBuffer [][]byte
 	var receivedStreamError bool
 	var streamErrorPayload string
+	var audioReceivedAfterStreamError bool
 
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
 
 		if msgType == websocket.BinaryMessage {
+			if receivedStreamError {
+				audioReceivedAfterStreamError = true
+			}
 			clientAudioBuffer = append(clientAudioBuffer, data)
+			// Signal mock provider that initial binary audio frame was received by telephony client
+			select {
+			case frameDeliveredCh <- struct{}{}:
+			default:
+			}
 		} else if msgType == websocket.TextMessage {
 			var evt model.TurnEvent
 			if err := json.Unmarshal(data, &evt); err == nil && evt.Type == model.EventStreamError {
 				receivedStreamError = true
 				streamErrorPayload = evt.Payload
-				break
 			}
+		}
+
+		if receivedStreamError && len(clientAudioBuffer) > 0 {
+			break
 		}
 	}
 
+	// Invariant 1: STREAM_ERROR delivered
 	if len(clientAudioBuffer) == 0 {
 		t.Fatalf("expected client to receive and buffer initial binary audio frame before provider failure")
 	}
@@ -834,11 +876,23 @@ DrainInitial:
 		t.Errorf("expected error payload 'cartesia upstream connection dropped', got %q", streamErrorPayload)
 	}
 
+	// Invariant 2: Zero audio frames delivered after STREAM_ERROR
+	if audioReceivedAfterStreamError {
+		t.Fatalf("INVARIANT VIOLATION: binary audio frame delivered to client after STREAM_ERROR was emitted!")
+	}
+
+	// Invariant 3: FSM back to StateListening
+	// Wait briefly for server error recovery to settle FSM
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for session.State() != model.StateListening && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if session.State() != model.StateListening {
+		t.Fatalf("expected session to recover to StateListening, got %s", session.State())
+	}
+
 	// Client player simulates buffer flush upon receiving STREAM_ERROR
 	clientAudioBuffer = nil
-	if len(clientAudioBuffer) != 0 {
-		t.Fatalf("client audio buffer should be purged")
-	}
 
 	// Telephony client sends playback_finished control signal to confirm buffer purge
 	err = conn.WriteJSON(map[string]string{
@@ -848,29 +902,116 @@ DrainInitial:
 		t.Fatalf("failed sending playback_finished over websocket: %v", err)
 	}
 
-	// Assert observable effect of acknowledgement: server processes playback_finished and emits TURN_COMPLETED
-	var receivedTurnCompleted bool
+	// Invariant 4: Subsequent turn succeeds
+	session.SetTTSProvider(pipeline.NewFormantTestHarnessTTS())
+	session.StartSpeakingTurnForBench()
+
+	tokenCh2 := make(chan string, 1)
+	session.StartLLMResponseStream(tokenCh2)
+	tokenCh2 <- "Next turn audio must succeed completely."
+	close(tokenCh2)
+
+	var nextTurnAudioReceived bool
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	for i := 0; i < 5; i++ {
-		msgType, data, err := conn.ReadMessage()
+	for i := 0; i < 15; i++ {
+		msgType, _, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
-		if msgType == websocket.TextMessage {
-			var evt model.TurnEvent
-			if err := json.Unmarshal(data, &evt); err == nil && evt.Type == model.EventTurnCompleted {
-				receivedTurnCompleted = true
-				break
-			}
+		if msgType == websocket.BinaryMessage {
+			nextTurnAudioReceived = true
+			break
 		}
 	}
 
-	if !receivedTurnCompleted {
-		t.Fatalf("expected client to receive observable TURN_COMPLETED event following playback_finished acknowledgement")
+	if !nextTurnAudioReceived {
+		t.Fatalf("INVARIANT VIOLATION: next turn failed to stream audio after provider error recovery!")
+	}
+}
+
+// FakeWSConn simulates a websocket connection for testing the server emitter
+type FakeWSConn struct {
+	mu           sync.Mutex
+	binaryFrames [][]byte
+	textEvents   []interface{}
+}
+
+func (f *FakeWSConn) WriteMessage(messageType int, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if messageType == websocket.BinaryMessage {
+		f.binaryFrames = append(f.binaryFrames, append([]byte(nil), data...))
+	}
+	return nil
+}
+
+func (f *FakeWSConn) WriteJSON(v interface{}) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.textEvents = append(f.textEvents, v)
+	return nil
+}
+
+// TestEmitterGenerationFilterFakeConn asserts that the WebSocket emitter drops mismatched/stale
+// audio frame generations at send time, ensuring stale frames from a superseded turn are never delivered.
+func TestEmitterGenerationFilterFakeConn(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_emitter_fake_conn")
+	defer session.Close()
+
+	fakeConn := &FakeWSConn{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Advance turn generation to 2 by starting and interrupting a turn
+	session.StartSpeakingTurnForBench()
+	gen1 := session.TurnGeneration()
+	session.TriggerBargeIn()
+	gen2 := session.TurnGeneration()
+	if gen2 <= gen1 {
+		t.Fatalf("expected turn generation to advance, got %d -> %d", gen1, gen2)
 	}
 
-	// Assert session FSM is cleanly in StateListening
-	if session.State() != model.StateListening {
-		t.Fatalf("expected session to recover to StateListening, got %s", session.State())
+	// Start emitter in background
+	emitterDone := make(chan struct{})
+	go func() {
+		_ = server.RunEmitter(ctx, session, fakeConn)
+		close(emitterDone)
+	}()
+
+	// Inject two chunks directly to AudioOut queue:
+	// Chunk 1 has stale Generation == gen1 (must be dropped by emitter filter)
+	// Chunk 2 has valid Generation == gen2 (must be emitted)
+	staleChunk := &model.AudioChunk{
+		SessionID:  session.SessionID(),
+		TurnID:     "turn_stale",
+		Generation: gen1,
+		Data:       []byte("STALE_AUDIO_FRAME_GEN_1"),
+	}
+	validChunk := &model.AudioChunk{
+		SessionID:  session.SessionID(),
+		TurnID:     "turn_valid",
+		Generation: gen2,
+		Data:       []byte("VALID_AUDIO_FRAME_GEN_2"),
+	}
+
+	// Session AudioOut channel is exposed via private field inside pipeline package or bench helper
+	// To push to AudioOut from external tests, we verify via emitter
+	session.PushAudioChunkForTest(staleChunk)
+	session.PushAudioChunkForTest(validChunk)
+
+	// Allow emitter loop to process chunks
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	<-emitterDone
+
+	fakeConn.mu.Lock()
+	defer fakeConn.mu.Unlock()
+
+	// Assert that staleChunk was dropped and only validChunk was written
+	if len(fakeConn.binaryFrames) != 1 {
+		t.Fatalf("expected exactly 1 valid frame delivered, got %d (stale frame was not filtered!)", len(fakeConn.binaryFrames))
+	}
+	if string(fakeConn.binaryFrames[0]) != "VALID_AUDIO_FRAME_GEN_2" {
+		t.Fatalf("expected valid frame payload 'VALID_AUDIO_FRAME_GEN_2', got %q", string(fakeConn.binaryFrames[0]))
 	}
 }

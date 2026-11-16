@@ -239,6 +239,21 @@ func (s *VoiceSession) SetSynthesisBarrierHook(hook func(turnGen uint64)) {
 	s.synthesisBarrierHook = hook
 }
 
+// TurnGeneration returns the current monotonic turn generation counter
+func (s *VoiceSession) TurnGeneration() uint64 {
+	return atomic.LoadUint64(&s.turnGen)
+}
+
+// PushAudioChunkForTest pushes an audio chunk directly into audioOut for testing emitter filters
+func (s *VoiceSession) PushAudioChunkForTest(chunk *model.AudioChunk) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case s.audioOut <- chunk:
+	default:
+	}
+}
+
 func (s *VoiceSession) IngestAudio(frame *model.AudioFrame) error {
 	s.mu.RLock()
 	if s.isClosed {
@@ -333,6 +348,7 @@ func (s *VoiceSession) StartSpeakingTurnForBench() {
 			SessionID:  s.sessionID,
 			TurnID:     turnID,
 			ChunkIdx:   i,
+			Generation: turnGen,
 			Data:       GenerateFormantAudioPCM(i * 320),
 			DurationMs: 20,
 			Timestamp:  time.Now().UnixMilli(),
@@ -499,11 +515,17 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			SessionID:  s.sessionID,
 			TurnID:     chunk.TurnID,
 			ChunkIdx:   chunk.Index*1000 + frameIdx,
+			Generation: turnGen,
 			Data:       pcmFrame,
 			DurationMs: int64(durationMs),
 			Timestamp:  time.Now().UnixMilli(),
 		}
 		frameIdx++
+
+		// Check generation before synthesis barrier hook
+		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
+			return ctx.Err()
+		}
 
 		s.mu.RLock()
 		hook := s.synthesisBarrierHook
@@ -512,7 +534,7 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			hook(turnGen)
 		}
 
-		// Guarded enqueue to guarantee no stale frame from an interrupted turn ever enters audioOut
+		// Re-check turnGen under lock before the send attempt
 		s.mu.Lock()
 		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 			s.mu.Unlock()
@@ -527,14 +549,15 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			default:
 			}
 		}
+		// Unlock before channel send: never hold mutex across a blocking send
+		s.mu.Unlock()
 
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case s.audioOut <- audioChunk:
 			metrics.DefaultMetrics.IncFrame()
-		default:
-			logger.L.Warn("audio_out_queue_full_dropped_frame", "session_id", s.sessionID)
 		}
-		s.mu.Unlock()
 
 		s.emitEvent(&model.TurnEvent{
 			Type:      model.EventTTSAudioChunk,
