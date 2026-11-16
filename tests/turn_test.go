@@ -609,3 +609,44 @@ func TestBargeInRaceWithConcurrentAudioSynthesis(t *testing.T) {
 	}
 }
 
+// TestCancelledContextNeverEnqueuesAudioWithBufferSpace proves that when a context is cancelled,
+// the enqueue path never selects the channel send case even when the channel buffer has ample space.
+// Go's select pseudo-randomly picks among ready cases; an explicit pre-select check of ctx.Err() is required.
+func TestCancelledContextNeverEnqueuesAudioWithBufferSpace(t *testing.T) {
+	session := pipeline.NewVoiceSession("sess_ctx_cancel_test")
+	defer session.Close()
+
+	session.StartSpeakingTurnForBench()
+DrainInitial:
+	for {
+		select {
+		case <-session.AudioOut():
+		default:
+			break DrainInitial
+		}
+	}
+
+	// Hook runs after mutex is unlocked but before select.
+	// It triggers barge-in / cancels turn context. Both <-ctx.Done() and s.audioOut <- audioChunk are ready.
+	session.SetPostUnlockHook(func() {
+		session.TriggerBargeIn()
+	})
+
+	tokenCh := make(chan string, 1)
+	session.StartLLMResponseStream(tokenCh)
+	tokenCh <- "Testing cancelled context select safety."
+	close(tokenCh)
+
+	// Wait briefly for worker to complete
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify zero chunks from that turn entered the channel
+	select {
+	case chunk := <-session.AudioOut():
+		t.Fatalf("INVARIANT VIOLATION: chunk enqueued into audioOut despite cancelled context! (turn=%s, idx=%d)",
+			chunk.TurnID, chunk.ChunkIdx)
+	default:
+		// Cleanly empty
+	}
+}
+

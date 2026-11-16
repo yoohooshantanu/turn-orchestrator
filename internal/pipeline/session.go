@@ -72,6 +72,7 @@ type VoiceSession struct {
 	graceWindow       time.Duration
 	eventListeners    []EventListener
 	synthesisBarrierHook func(turnGen uint64)
+	postUnlockHook       func()
 	ttsProvider          StreamingTTSProvider
 }
 
@@ -237,6 +238,12 @@ func (s *VoiceSession) SetSynthesisBarrierHook(hook func(turnGen uint64)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.synthesisBarrierHook = hook
+}
+
+func (s *VoiceSession) SetPostUnlockHook(hook func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.postUnlockHook = hook
 }
 
 // TurnGeneration returns the current monotonic turn generation counter
@@ -551,6 +558,19 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		}
 		// Unlock before channel send: never hold mutex across a blocking send
 		s.mu.Unlock()
+
+		s.mu.RLock()
+		postUnlock := s.postUnlockHook
+		s.mu.RUnlock()
+		if postUnlock != nil {
+			postUnlock()
+		}
+
+		// Explicit pre-select guard: Go select pseudo-randomly chooses among ready cases
+		// when both channel send and <-ctx.Done() are simultaneously unblocked.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		select {
 		case <-ctx.Done():

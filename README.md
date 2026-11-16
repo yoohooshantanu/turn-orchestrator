@@ -120,16 +120,18 @@ VocalFlow decouples turn orchestration from speech synthesis providers via the `
 
 ## Verification & Testing
 
-Run all 26 unit, integration, security, and concurrency tests:
+Run all 27 unit, integration, security, and concurrency tests:
 
 ```bash
 $env:CGO_ENABLED="0"; $env:GOPROXY="off"; $env:GOTOOLCHAIN="local"
 go test -v -mod=readonly ./tests/...
 ```
 
+> **Toolchain Note:** Local benchmarks were run on Go 1.24 (Windows amd64); GitHub Actions CI runs on Go 1.23 (Ubuntu x86_64).
+
 ### Verified Benchmark Performance
 
-Benchmarks measured via `benchstat` over 10 independent runs (`-count=10`) on AMD Ryzen 5 (Windows amd64, Go 1.24):
+Benchmarks measured via `benchstat` over 10 independent runs (`-count=10`) on AMD Ryzen 5 (Windows amd64, Go 1.24). Setup overhead (`NewVoiceSession`, FSM creation, channel allocations, and turn initialization) is isolated and excluded from the timed interruption regions via `b.StopTimer()`:
 
 ```text
 goarch: amd64
@@ -138,21 +140,22 @@ cpu: AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx
 
 Benchmark                                 Time (sec/op)      Memory (B/op)   Allocs (allocs/op)
 -----------------------------------------------------------------------------------------------
-TriggerBargeInDirect-8                    276.8µs ± 17%          4.19 KiB        29.00 ± 0%
-BargeInCancellationLatency-8              337.8µs ± 14%         16.55 KiB        63.00 ± 0%
-EndToEndBargeInPipeline-8                 355.2µs ± 17%         16.62 KiB        68.00 ± 0%
-RMSEnergyCalculation-8                      2.77µs ± 27%             0 B          0.00 ± 0%
-SentenceChunker-8                          21.53µs ± 23%           672 B         17.00 ± 0%
+SpeakingTurnSetupAlone-8                  204.5µs ± 10%         16.33 KiB        54.00 ± 0%
+BargeInCancellationLatency-8               22.34µs ± 20%           224 B          9.00 ± 0%
+TriggerBargeInDirect-8                     24.07µs ± 12%           224 B          9.00 ± 0%
+EndToEndBargeInPipeline-8                  41.46µs ± 32%           295 B         14.00 ± 0%
+RMSEnergyCalculation-8                      7.77µs ± 84%             0 B          0.00 ± 0%
+SentenceChunker-8                          36.70µs ± 86%           672 B         17.00 ± 0%
 ```
 
 > **Latency Definitions & Boundary Clarifications:**
 > - **Barge-In Latency Definition:** Defined precisely as `(barge-in detected -> last stale frame sent)`. It measures the elapsed interval from when the interruption is identified until the engine stops emitting frames from that turn.
 > - **In-Flight & Client Buffer Scope:** When `TriggerBargeIn()` returns, **at most one frame** can already be in flight (if currently being serialized over the socket connection), plus whatever unplayed audio is buffered in the client player's local hardware buffer. VocalFlow emits a `BARGE_IN_TRIGGERED` control event over WebSocket so the client player can immediately flush its hardware audio queue upon arrival.
-> - **In-Process Cancellation vs End-to-End Pipeline:**
->   - **In-Process Cancellation (`TriggerBargeInDirect` ~276.8 µs):** Measures the pure engine interrupt cost (mutex acquisition, active turn context cancellation, atomic turn generation increment, output queue drain, and FSM transition from `SPEAKING` $\rightarrow$ `INTERRUPTED` $\rightarrow$ `LISTENING`).
->   - **End-to-End Pipeline (`EndToEndBargeInPipeline` ~355.2 µs):** Measures the full internal pipeline from incoming raw 16kHz PCM audio bytes $\rightarrow$ RMS calculation $\rightarrow$ VAD voiced threshold detection $\rightarrow$ Barge-in callback $\rightarrow$ Context cancellation $\rightarrow$ Audio buffer drain $\rightarrow$ FSM transition $\rightarrow$ WebSocket event emission.
-> - **OS Timer Resolution Note:** Measured on Windows using Go's standard benchmarking harness backed by high-resolution QueryPerformanceCounter (QPC). Standard OS thread scheduling ticks on Windows range between 1–15ms; by executing thousands of iterations per run with `-count=10`, `benchstat` accurately isolates nanosecond/microsecond execution costs from OS scheduling jitter.
-> - **Telephony SLA Budget:** In telephony voice systems, conversational perception expects barge-in interruption within **40 milliseconds**. VocalFlow's engine interrupt handling completes in **~0.28–0.36 ms (276–355 µs)**, preserving **>39.6 ms of latency budget** for network jitter, SIP carrier packetization, and client playback buffer purging.
+> - **Physical VAD Detection Window (`internal/vad/vad.go`):** Ingested audio is processed in standard 20ms frames (640 bytes at 16kHz 16-bit mono). The VAD requires `BargeInMinFrames: 2` consecutive voiced frames with RMS energy above `EnergyThreshold: 0.02` to confirm caller speech ($2 \times 20\text{ms} = \mathbf{40\text{ms}}$ physical audio accumulation window).
+> - **In-Process Cancellation vs Processing Time After Frames Arrive:**
+>   - **In-Process Cancellation (`TriggerBargeInDirect` ~24.1 µs):** Measures pure engine interrupt cost (mutex acquisition, active turn context cancellation, atomic turn generation increment, output queue drain, and FSM transition from `SPEAKING` $\rightarrow$ `INTERRUPTED` $\rightarrow$ `LISTENING`).
+>   - **Processing Time After Frames Arrive (`EndToEndBargeInPipeline` ~41.5 µs):** Measures internal computation after the required voiced audio frames arrive: RMS energy calculation $\rightarrow$ VAD threshold evaluation $\rightarrow$ Barge-in callback $\rightarrow$ Context cancellation $\rightarrow$ Audio buffer drain $\rightarrow$ FSM transition $\rightarrow$ WebSocket event emission.
+>   - **Setup Overhead (`SpeakingTurnSetupAlone` ~204.5 µs):** Measures the baseline cost of session allocation, FSM setup, channel creation, and synthetic PCM frame pre-buffering. Isolating setup via `b.StopTimer()` separates session initialization costs from true interrupt latency.
 
 ---
 

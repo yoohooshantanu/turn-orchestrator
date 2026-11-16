@@ -45,31 +45,53 @@ func BenchmarkSentenceChunker(b *testing.B) {
 	}
 }
 
-func BenchmarkBargeInCancellationLatency(b *testing.B) {
+// BenchmarkSpeakingTurnSetupAlone measures the overhead of session creation,
+// turn initialization, and audio chunk pre-buffering alone (no barge-in).
+func BenchmarkSpeakingTurnSetupAlone(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sess := pipeline.NewVoiceSession("sess_bench_barge")
-		// Put session into verified Speaking state with cancelable context and queued audio
+		sess := pipeline.NewVoiceSession("sess_bench_setup")
 		sess.StartSpeakingTurnForBench()
-		sess.TriggerBargeIn()
 		sess.Close()
+	}
+}
+
+// BenchmarkBargeInCancellationLatency measures in-process cancellation latency
+// with session creation and turn setup excluded from the timed region.
+func BenchmarkBargeInCancellationLatency(b *testing.B) {
+	sess := pipeline.NewVoiceSession("sess_bench_barge")
+	defer sess.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		sess.StartSpeakingTurnForBench()
+		b.StartTimer()
+
+		sess.TriggerBargeIn()
 	}
 }
 
 // BenchmarkTriggerBargeInDirect isolates pure in-process cancellation latency (mutex acquisition,
 // context cancellation, atomic generation increment, output queue drain, and FSM transition)
-// from session allocation and teardown overhead.
+// from all setup overhead.
 func BenchmarkTriggerBargeInDirect(b *testing.B) {
 	sess := pipeline.NewVoiceSession("sess_bench_direct")
 	defer sess.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
 		sess.StartSpeakingTurnForBench()
+		b.StartTimer()
+
 		sess.TriggerBargeIn()
 	}
 }
 
+// BenchmarkEndToEndBargeInPipeline measures processing time after frames arrive:
+// raw PCM ingestion -> RMS calculation -> VAD voiced detection -> Barge-in execution -> event emission.
+// Session setup is excluded from the timed region via StopTimer.
 func BenchmarkEndToEndBargeInPipeline(b *testing.B) {
 	pcm := make([]byte, 640)
 	for i := 0; i < len(pcm); i += 2 {
@@ -77,16 +99,17 @@ func BenchmarkEndToEndBargeInPipeline(b *testing.B) {
 		pcm[i+1] = 0x25 // RMS energy ~0.07 > 0.02 threshold
 	}
 
+	sess := pipeline.NewVoiceSession("sess_bench_e2e")
+	defer sess.Close()
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sess := pipeline.NewVoiceSession("sess_bench_e2e")
-		// Put session into active Speaking state with buffered audio
+		b.StopTimer()
 		sess.StartSpeakingTurnForBench()
+		b.StartTimer()
 
 		// Feed consecutive voiced PCM frames through VAD to trigger Barge-In
 		_ = sess.IngestAudio(&model.AudioFrame{Data: pcm})
 		_ = sess.IngestAudio(&model.AudioFrame{Data: pcm})
-
-		sess.Close()
 	}
 }
