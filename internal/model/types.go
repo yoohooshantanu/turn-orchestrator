@@ -73,6 +73,13 @@ type AudioChunk struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+// TurnMetrics tracks turn-level latency and performance benchmarks.
+//
+// TTFA (Time-to-First-Audio) specifically measures backend pipeline latency: the duration
+// from user silence detection (VAD cutoff) until arrival of the first synthesized PCM audio
+// frame from the TTS engine ready for network transmission. Caller-perceived ear-to-speaker
+// audio playback latency additionally includes downstream network transport latency and client
+// jitter buffering.
 type TurnMetrics struct {
 	SessionID             string        `json:"session_id"`
 	TurnID                string        `json:"turn_id"`

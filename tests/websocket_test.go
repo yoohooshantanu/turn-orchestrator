@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -754,4 +755,103 @@ func TestTTSProviderEnvironmentConfiguration(t *testing.T) {
 
 	os.Unsetenv("TTS_PROVIDER")
 	os.Unsetenv("CARTESIA_API_KEY")
+}
+
+// TestWebSocketStreamFailureClientRecovery verifies end-to-end WebSocket protocol behavior when mid-stream synthesis fails:
+// 1. Telephony client connects over WebSocket to /ws/voice/{id}.
+// 2. TTS emits frame 1 as binary PCM over the network, then fails mid-stream with simulated upstream provider error.
+// 3. Telephony client receives binary PCM frame 1.
+// 4. Server emits STREAM_ERROR control event, which client receives as JSON text frame.
+// 5. Client clears local playback buffer and acknowledges recovery with playback_finished.
+// 6. Server session recovers cleanly to StateListening ready for the next interaction turn.
+func TestWebSocketStreamFailureClientRecovery(t *testing.T) {
+	mgr := pipeline.NewSessionManager(5 * time.Minute)
+	defer mgr.Stop()
+
+	handler := server.NewServerHandler(mgr)
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	sessionID := "sess_stream_fail_ws_" + uuid.NewString()[:8]
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws/voice/" + sessionID
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed connecting websocket: %v", err)
+	}
+	defer conn.Close()
+
+	session := mgr.GetOrCreate(sessionID)
+	session.SetTTSProvider(&MockFailingTTS{})
+
+	// Drain any initial benchmark chunks from session creation
+	session.StartSpeakingTurnForBench()
+DrainInitial:
+	for {
+		select {
+		case <-session.AudioOut():
+		default:
+			break DrainInitial
+		}
+	}
+
+	tokenCh := make(chan string, 1)
+	session.StartLLMResponseStream(tokenCh)
+	tokenCh <- "Testing websocket stream error recovery."
+	close(tokenCh)
+
+	// Client receives binary audio frame 1 followed by text STREAM_ERROR event
+	var receivedBinaryFrame bool
+	var receivedStreamError bool
+	var streamErrorPayload string
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for i := 0; i < 10; i++ {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		if msgType == websocket.BinaryMessage {
+			receivedBinaryFrame = true
+		} else if msgType == websocket.TextMessage {
+			var evt model.TurnEvent
+			if err := json.Unmarshal(data, &evt); err == nil && evt.Type == model.EventStreamError {
+				receivedStreamError = true
+				streamErrorPayload = evt.Payload
+				break
+			}
+		}
+	}
+
+	if !receivedBinaryFrame {
+		t.Fatalf("expected client to receive initial binary audio frame before provider failure")
+	}
+	if !receivedStreamError {
+		t.Fatalf("expected client to receive STREAM_ERROR text JSON event over WebSocket")
+	}
+	if !strings.Contains(streamErrorPayload, "cartesia upstream connection dropped") {
+		t.Errorf("expected error payload 'cartesia upstream connection dropped', got %q", streamErrorPayload)
+	}
+
+	// Telephony client sends playback_finished control signal to confirm buffer purge
+	err = conn.WriteJSON(map[string]string{
+		"type": "playback_finished",
+	})
+	if err != nil {
+		t.Fatalf("failed sending playback_finished over websocket: %v", err)
+	}
+
+	// Assert session FSM recovers cleanly to StateListening
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if session.State() == model.StateListening {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if session.State() != model.StateListening {
+		t.Fatalf("expected session to recover to StateListening, got %s", session.State())
+	}
 }

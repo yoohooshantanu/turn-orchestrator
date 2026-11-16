@@ -145,13 +145,21 @@ func (s *VoiceSession) GetTurnMetrics(turnID string) (*model.TurnMetrics, bool) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	m, ok := s.turnHistory[turnID]
-	return m, ok
+	if !ok || m == nil {
+		return nil, false
+	}
+	copied := *m
+	return &copied, true
 }
 
 func (s *VoiceSession) GetActiveTurnMetrics() *model.TurnMetrics {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.activeTurnMetrics
+	if s.activeTurnMetrics == nil {
+		return nil
+	}
+	copied := *s.activeTurnMetrics
+	return &copied
 }
 
 // SetActiveTurnSilenceDetectedAt configures user silence detection timestamp for synthetic benchmark or test turns
@@ -456,7 +464,9 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			return ctx.Err()
 		}
 
-		// Record accurate Time-to-First-Audio (TTFA) upon arrival of the very FIRST synthesized audio frame
+		// Record accurate Time-to-First-Audio (TTFA) upon arrival of the very FIRST synthesized audio frame.
+		// Note: TTFA measures backend pipeline latency (user silence detection -> first synthesized PCM frame from TTS ready for transmission).
+		// Downstream network delivery and client jitter buffering are excluded.
 		s.mu.Lock()
 		if s.activeTurnMetrics != nil && s.activeTurnMetrics.FirstAudioReadyAt.IsZero() {
 			now := time.Now()
