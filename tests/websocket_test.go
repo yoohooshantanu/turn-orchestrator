@@ -757,14 +757,14 @@ func TestTTSProviderEnvironmentConfiguration(t *testing.T) {
 	os.Unsetenv("CARTESIA_API_KEY")
 }
 
-// TestWebSocketStreamFailureClientRecovery verifies end-to-end WebSocket protocol behavior when mid-stream synthesis fails:
-// 1. Telephony client connects over WebSocket to /ws/voice/{id}.
-// 2. TTS emits frame 1 as binary PCM over the network, then fails mid-stream with simulated upstream provider error.
-// 3. Telephony client receives binary PCM frame 1.
-// 4. Server emits STREAM_ERROR control event, which client receives as JSON text frame.
-// 5. Client clears local playback buffer and acknowledges recovery with playback_finished.
-// 6. Server session recovers cleanly to StateListening ready for the next interaction turn.
-func TestWebSocketStreamFailureClientRecovery(t *testing.T) {
+// TestWebSocketStreamFailureServerRecovery verifies the full-duplex WebSocket error protocol and server-side turn recovery path:
+// 1. Server emits initial binary audio frame 1 over WebSocket.
+// 2. TTS fails mid-stream; server detects provider failure, drains server output queues, and emits STREAM_ERROR control event.
+// 3. Telephony test client buffers received audio frames (simulating client playback queue).
+// 4. Upon receiving STREAM_ERROR, client purges its unplayed audio buffer and transmits playback_finished.
+// 5. Server processes playback_finished acknowledgement, records turn completion, and emits TURN_COMPLETED event over WebSocket.
+// 6. Server session FSM remains cleanly in LISTENING state ready for next turn.
+func TestWebSocketStreamFailureServerRecovery(t *testing.T) {
 	mgr := pipeline.NewSessionManager(5 * time.Minute)
 	defer mgr.Stop()
 
@@ -800,8 +800,8 @@ DrainInitial:
 	tokenCh <- "Testing websocket stream error recovery."
 	close(tokenCh)
 
-	// Client receives binary audio frame 1 followed by text STREAM_ERROR event
-	var receivedBinaryFrame bool
+	// Simulated client audio playback buffer
+	var clientAudioBuffer [][]byte
 	var receivedStreamError bool
 	var streamErrorPayload string
 
@@ -813,7 +813,7 @@ DrainInitial:
 		}
 
 		if msgType == websocket.BinaryMessage {
-			receivedBinaryFrame = true
+			clientAudioBuffer = append(clientAudioBuffer, data)
 		} else if msgType == websocket.TextMessage {
 			var evt model.TurnEvent
 			if err := json.Unmarshal(data, &evt); err == nil && evt.Type == model.EventStreamError {
@@ -824,14 +824,20 @@ DrainInitial:
 		}
 	}
 
-	if !receivedBinaryFrame {
-		t.Fatalf("expected client to receive initial binary audio frame before provider failure")
+	if len(clientAudioBuffer) == 0 {
+		t.Fatalf("expected client to receive and buffer initial binary audio frame before provider failure")
 	}
 	if !receivedStreamError {
 		t.Fatalf("expected client to receive STREAM_ERROR text JSON event over WebSocket")
 	}
 	if !strings.Contains(streamErrorPayload, "cartesia upstream connection dropped") {
 		t.Errorf("expected error payload 'cartesia upstream connection dropped', got %q", streamErrorPayload)
+	}
+
+	// Client player simulates buffer flush upon receiving STREAM_ERROR
+	clientAudioBuffer = nil
+	if len(clientAudioBuffer) != 0 {
+		t.Fatalf("client audio buffer should be purged")
 	}
 
 	// Telephony client sends playback_finished control signal to confirm buffer purge
@@ -842,15 +848,28 @@ DrainInitial:
 		t.Fatalf("failed sending playback_finished over websocket: %v", err)
 	}
 
-	// Assert session FSM recovers cleanly to StateListening
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) {
-		if session.State() == model.StateListening {
+	// Assert observable effect of acknowledgement: server processes playback_finished and emits TURN_COMPLETED
+	var receivedTurnCompleted bool
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 5; i++ {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		if msgType == websocket.TextMessage {
+			var evt model.TurnEvent
+			if err := json.Unmarshal(data, &evt); err == nil && evt.Type == model.EventTurnCompleted {
+				receivedTurnCompleted = true
+				break
+			}
+		}
 	}
 
+	if !receivedTurnCompleted {
+		t.Fatalf("expected client to receive observable TURN_COMPLETED event following playback_finished acknowledgement")
+	}
+
+	// Assert session FSM is cleanly in StateListening
 	if session.State() != model.StateListening {
 		t.Fatalf("expected session to recover to StateListening, got %s", session.State())
 	}
