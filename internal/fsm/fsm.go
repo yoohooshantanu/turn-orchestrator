@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
-	"github.com/yoohooshantanu/vocalflow/internal/model"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/model"
 )
 
 type StateChangeHook func(from, to model.ConversationState)

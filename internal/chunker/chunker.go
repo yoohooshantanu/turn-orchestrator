@@ -6,9 +6,9 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
-	"github.com/yoohooshantanu/vocalflow/internal/metrics"
-	"github.com/yoohooshantanu/vocalflow/internal/model"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/metrics"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/model"
 )
 
 type SentenceChunkCallback func(chunk *model.SentenceChunk)

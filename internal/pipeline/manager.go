@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
 )
 
 // TTSProviderFactory constructs a new streaming TTS provider instance for a session

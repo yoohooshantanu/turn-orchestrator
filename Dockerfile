@@ -12,17 +12,17 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-s -w" \
-    -o /vocalflow \
+    -o /turn-orchestrator \
     ./cmd/server
 
 # Stage 2: Minimal runtime image
 FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /vocalflow /vocalflow
+COPY --from=builder /turn-orchestrator /turn-orchestrator
 
 EXPOSE 8085
 
 ENV PORT=8085
 
-ENTRYPOINT ["/vocalflow"]
+ENTRYPOINT ["/turn-orchestrator"]

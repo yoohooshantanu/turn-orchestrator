@@ -16,10 +16,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/yoohooshantanu/vocalflow/internal/model"
-	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
-	"github.com/yoohooshantanu/vocalflow/internal/server"
-	"github.com/yoohooshantanu/vocalflow/internal/vad"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/model"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/pipeline"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/server"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/vad"
 )
 
 func TestFormantWaveformSynthesis(t *testing.T) {
@@ -144,7 +144,7 @@ func TestWebSocketOriginSecurityValidation(t *testing.T) {
 }
 
 func TestWebSocketAuthentication(t *testing.T) {
-	os.Setenv("AUTH_TOKEN", "vocalflow_secret_token_99")
+	os.Setenv("AUTH_TOKEN", "turn_orchestrator_secret_token_99")
 	defer os.Unsetenv("AUTH_TOKEN")
 
 	mgr := pipeline.NewSessionManager(5 * time.Minute)
@@ -167,7 +167,7 @@ func TestWebSocketAuthentication(t *testing.T) {
 
 	// 2. Connection with Bearer token header -> Accepted (101)
 	headerAuth := http.Header{}
-	headerAuth.Set("Authorization", "Bearer vocalflow_secret_token_99")
+	headerAuth.Set("Authorization", "Bearer turn_orchestrator_secret_token_99")
 	connBearer, respBearer, err := websocket.DefaultDialer.Dial(wsURL, headerAuth)
 	if err != nil {
 		t.Fatalf("expected valid Bearer token to connect, got: %v", err)
@@ -178,7 +178,7 @@ func TestWebSocketAuthentication(t *testing.T) {
 	_ = connBearer.Close()
 
 	// 3. Query string token (?token=...) MUST BE REJECTED (prevent credential leaks into logs)
-	wsURLQuery := wsURL + "?token=vocalflow_secret_token_99"
+	wsURLQuery := wsURL + "?token=turn_orchestrator_secret_token_99"
 	_, respQuery, err := websocket.DefaultDialer.Dial(wsURLQuery, nil)
 	if err == nil {
 		t.Fatalf("query-string token must be rejected with 401")

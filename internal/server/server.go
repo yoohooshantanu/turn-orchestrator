@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
-	"github.com/yoohooshantanu/vocalflow/internal/metrics"
-	"github.com/yoohooshantanu/vocalflow/internal/model"
-	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
-	"github.com/yoohooshantanu/vocalflow/internal/vad"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/metrics"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/model"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/pipeline"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/vad"
 )
 
 // WSWriter defines the subset of websocket write methods used by the emitter

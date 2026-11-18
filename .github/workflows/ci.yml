@@ -1,4 +1,4 @@
-name: VocalFlow CI
+name: TurnOrchestrator CI
 
 on:
   push:
@@ -24,4 +24,4 @@ jobs:
         run: go test -v -race ./tests/...
 
       - name: Build Server Binary
-        run: go build -v -o bin/vocalflow ./cmd/server
+        run: go build -v -o bin/turn-orchestrator ./cmd/server

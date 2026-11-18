@@ -8,9 +8,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
-	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
-	"github.com/yoohooshantanu/vocalflow/internal/server"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/pipeline"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/server"
 )
 
 func getEnv(key, defaultVal string) string {
@@ -22,7 +22,7 @@ func getEnv(key, defaultVal string) string {
 
 func main() {
 	port := getEnv("PORT", "8085")
-	logger.L.Info("starting_vocalflow_engine", "port", port)
+	logger.L.Info("starting_turn_orchestrator_engine", "port", port)
 
 	mgr := pipeline.NewSessionManager(30 * time.Minute)
 	mgr.SetTTSFactory(func() pipeline.StreamingTTSProvider {
@@ -38,7 +38,7 @@ func main() {
 	}
 
 	go func() {
-		logger.L.Info("vocalflow_listening", "port", port)
+		logger.L.Info("turn_orchestrator_listening", "port", port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.L.Error("server_listen_failed", "error", err)
 		}
@@ -48,11 +48,11 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.L.Info("shutting_down_vocalflow")
+	logger.L.Info("shutting_down_turn-orchestrator")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	_ = httpServer.Shutdown(ctx)
 	mgr.Stop()
-	logger.L.Info("vocalflow_terminated_cleanly")
+	logger.L.Info("turn_orchestrator_terminated_cleanly")
 }

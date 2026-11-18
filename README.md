@@ -1,10 +1,10 @@
-# VocalFlow: Real-Time Voice AI Turn & Barge-In Orchestration Engine
+# TurnOrchestrator: Real-Time Voice AI Turn & Barge-In Orchestration Engine
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/yoohooshantanu/vocalflow.svg)](https://pkg.go.dev/github.com/yoohooshantanu/vocalflow)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yoohooshantanu/vocalflow)](https://goreportcard.com/report/github.com/yoohooshantanu/vocalflow)
+[![Go Reference](https://pkg.go.dev/badge/github.com/yoohooshantanu/turn-orchestrator.svg)](https://pkg.go.dev/github.com/yoohooshantanu/turn-orchestrator)
+[![Go Report Card](https://goreportcard.com/badge/github.com/yoohooshantanu/turn-orchestrator)](https://goreportcard.com/report/github.com/yoohooshantanu/turn-orchestrator)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**VocalFlow** is a low-latency, full-duplex conversational turn orchestration engine written in Go. Designed for mission-critical AI voice agents (telephony and WebRTC), VocalFlow solves the two hardest real-time voice challenges: **sub-250ms Time-to-First-Audio (TTFA)** and **sub-millisecond atomic barge-in interruption cancellation** with **turn-generation race elimination**, **binary PCM audio streaming**, and **in-memory session reconnect recovery**.
+**TurnOrchestrator** is a low-latency, full-duplex conversational turn orchestration engine written in Go. Designed for mission-critical AI voice agents (telephony and WebRTC), TurnOrchestrator solves the two hardest real-time voice challenges: **sub-250ms Time-to-First-Audio (TTFA)** and **sub-millisecond atomic barge-in interruption cancellation** with **turn-generation race elimination**, **binary PCM audio streaming**, and **in-memory session reconnect recovery**.
 
 ---
 
@@ -64,10 +64,10 @@
    - Query string tokens (`?token=...`) are explicitly rejected to prevent token leakage in proxy logs and browser histories.
    - In production (`REQUIRE_AUTH=true`), unset token configuration fails closed (`TestWebSocketFailClosedSecurity`).
 4. **Streaming Clause-Boundary Sentence Chunker**:
-   - Rather than waiting for complete LLM responses (which incurs 2-3s delays), VocalFlow chunks streaming tokens at clause boundaries (`,`, `;`, `:`) after 3–5 words for the first chunk, kicking off neural TTS synthesis in parallel.
+   - Rather than waiting for complete LLM responses (which incurs 2-3s delays), TurnOrchestrator chunks streaming tokens at clause boundaries (`,`, `;`, `:`) after 3–5 words for the first chunk, kicking off neural TTS synthesis in parallel.
    - Handles honorific abbreviations (`Dr.`, `Mr.`, `Ms.`, `Prof.`, `vs.`, `etc.`), currency amounts (`$10,000`), and ellipses (`...`).
 5. **Sub-Millisecond In-Process Interruption Scheduling**:
-   - When a caller speaks while the AI is thinking or speaking, VocalFlow cancels the active `context.Context`, dumps pending audio playback packets, and emits a `BARGE_IN_TRIGGERED` control event to immediately clear client speaker buffers.
+   - When a caller speaks while the AI is thinking or speaking, TurnOrchestrator cancels the active `context.Context`, dumps pending audio playback packets, and emits a `BARGE_IN_TRIGGERED` control event to immediately clear client speaker buffers.
 6. **Turn-Taking Finite State Machine (FSM)**:
    - Governs conversational states: `IDLE` $\rightarrow$ `LISTENING` $\rightarrow$ `THINKING` $\rightarrow$ `SPEAKING` $\rightarrow$ `DRAINING` $\rightarrow$ `INTERRUPTED`.
    - Thread-safe state transition validation protects against race conditions during rapid turn-taking.
@@ -75,13 +75,13 @@
    - Telephony client disconnects mark the session detached with a 60-second recovery grace window (`ShouldExpire`).
    - Reconnecting with the same `session_id` reattaches the audio queue without losing dialogue history.
 8. **Real-Time Telemetry & Prometheus Sidecar**:
-   - Prometheus metrics tracking Time-to-First-Audio (TTFA), Time-to-First-Token (TTFT), sub-millisecond barge-in reaction latency (`vocalflow_avg_barge_in_reaction_ms`), active sessions, and sentences synthesized.
+   - Prometheus metrics tracking Time-to-First-Audio (TTFA), Time-to-First-Token (TTFT), sub-millisecond barge-in reaction latency (`turn_orchestrator_avg_barge_in_reaction_ms`), active sessions, and sentences synthesized.
 
 ---
 
 ## Audio Synthesis & Streaming TTS Architecture
 
-VocalFlow decouples turn orchestration from speech synthesis providers via the `StreamingTTSProvider` interface:
+TurnOrchestrator decouples turn orchestration from speech synthesis providers via the `StreamingTTSProvider` interface:
 
 1. **Cartesia Sonic WebSocket Streaming Adapter (`CartesiaStreamingTTS`)**:
    - Production WebSocket streaming client connecting to `wss://api.cartesia.ai/tts/websocket?cartesia_version=2024-06-10`.
@@ -135,7 +135,7 @@ Benchmarks measured via `benchstat` over 10 independent runs (`-count=10`) on AM
 
 ```text
 goarch: amd64
-pkg: github.com/yoohooshantanu/vocalflow/tests
+pkg: github.com/yoohooshantanu/turn-orchestrator/tests
 cpu: AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx  
 
 Benchmark                                 Time (sec/op)      Memory (B/op)   Allocs (allocs/op)
@@ -150,7 +150,7 @@ SentenceChunker-8                          36.70µs ± 86%           672 B      
 
 > **Latency Definitions & Boundary Clarifications:**
 > - **Barge-In Latency Definition:** Defined precisely as `(barge-in detected -> last stale frame sent)`. It measures the elapsed interval from when the interruption is identified until the engine stops emitting frames from that turn.
-> - **In-Flight & Client Buffer Scope:** When `TriggerBargeIn()` returns, **at most one frame** can already be in flight (if currently being serialized over the socket connection), plus whatever unplayed audio is buffered in the client player's local hardware buffer. VocalFlow emits a `BARGE_IN_TRIGGERED` control event over WebSocket so the client player can immediately flush its hardware audio queue upon arrival.
+> - **In-Flight & Client Buffer Scope:** When `TriggerBargeIn()` returns, **at most one frame** can already be in flight (if currently being serialized over the socket connection), plus whatever unplayed audio is buffered in the client player's local hardware buffer. TurnOrchestrator emits a `BARGE_IN_TRIGGERED` control event over WebSocket so the client player can immediately flush its hardware audio queue upon arrival.
 > - **Physical VAD Detection Window (`internal/vad/vad.go`):** Ingested audio is processed in standard 20ms frames (640 bytes at 16kHz 16-bit mono). The VAD requires `BargeInMinFrames: 2` consecutive voiced frames with RMS energy above `EnergyThreshold: 0.02` to confirm caller speech ($2 \times 20\text{ms} = \mathbf{40\text{ms}}$ physical audio accumulation window).
 > - **In-Process Cancellation vs Processing Time After Frames Arrive:**
 >   - **In-Process Cancellation (`TriggerBargeInDirect` ~24.1 µs):** Measures pure engine interrupt cost (mutex acquisition, active turn context cancellation, atomic turn generation increment, output queue drain, and FSM transition from `SPEAKING` $\rightarrow$ `INTERRUPTED` $\rightarrow$ `LISTENING`).
@@ -161,13 +161,13 @@ SentenceChunker-8                          36.70µs ± 86%           672 B      
 
 ## Production Deployment & Docker
 
-Deploy VocalFlow and Prometheus sidecar with Docker Compose:
+Deploy TurnOrchestrator and Prometheus sidecar with Docker Compose:
 
 ```bash
 docker-compose up -d
 ```
 
-- **VocalFlow Gateway:** `http://localhost:8085` (WS: `ws://localhost:8085/ws/voice/{session_id}`)
+- **TurnOrchestrator Gateway:** `http://localhost:8085` (WS: `ws://localhost:8085/ws/voice/{session_id}`)
 - **Prometheus Metrics:** `http://localhost:8085/metrics`
 - **Prometheus UI:** `http://localhost:9090`
 - **pprof Profiling:** `http://localhost:8085/debug/pprof/`
@@ -175,7 +175,7 @@ docker-compose up -d
 Compile binary:
 
 ```bash
-go build -o bin/vocalflow.exe ./cmd/server
+go build -o bin/turn-orchestrator.exe ./cmd/server
 ```
 
 ---

@@ -1,31 +1,31 @@
 version: "3.8"
 
 services:
-  vocalflow:
+  turn-orchestrator:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: vocalflow-engine
+    container_name: turn-orchestrator-engine
     ports:
       - "8085:8085"
     environment:
       - PORT=8085
     restart: unless-stopped
     networks:
-      - vocalflow-net
+      - turn-orchestrator-net
 
   prometheus:
     image: prom/prometheus:latest
-    container_name: vocalflow-prometheus
+    container_name: turn-orchestrator-prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
     networks:
-      - vocalflow-net
+      - turn-orchestrator-net
     depends_on:
-      - vocalflow
+      - turn-orchestrator
 
 networks:
-  vocalflow-net:
+  turn-orchestrator-net:
     driver: bridge

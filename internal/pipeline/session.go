@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yoohooshantanu/vocalflow/internal/chunker"
-	"github.com/yoohooshantanu/vocalflow/internal/fsm"
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
-	"github.com/yoohooshantanu/vocalflow/internal/metrics"
-	"github.com/yoohooshantanu/vocalflow/internal/model"
-	"github.com/yoohooshantanu/vocalflow/internal/vad"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/chunker"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/fsm"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/metrics"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/model"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/vad"
 )
 
 

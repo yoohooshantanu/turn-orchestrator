@@ -2,6 +2,6 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
-  - job_name: "vocalflow"
+  - job_name: "turn-orchestrator"
     static_configs:
-      - targets: ["vocalflow:8085"]
+      - targets: ["turn-orchestrator:8085"]

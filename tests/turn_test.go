@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoohooshantanu/vocalflow/internal/chunker"
-	"github.com/yoohooshantanu/vocalflow/internal/fsm"
-	"github.com/yoohooshantanu/vocalflow/internal/model"
-	"github.com/yoohooshantanu/vocalflow/internal/pipeline"
-	"github.com/yoohooshantanu/vocalflow/internal/vad"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/chunker"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/fsm"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/model"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/pipeline"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/vad"
 )
 
 func TestFSMStateTransitions(t *testing.T) {

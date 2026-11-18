@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/yoohooshantanu/vocalflow/internal/logger"
+	"github.com/yoohooshantanu/turn-orchestrator/internal/logger"
 )
 
 // AudioChunkHandler is called incrementally for each incoming synthesized audio frame
