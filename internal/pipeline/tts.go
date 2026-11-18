@@ -106,7 +106,9 @@ func (c *CartesiaStreamingTTS) SynthesizeStream(ctx context.Context, text string
 	}
 
 	if c.apiKey == "" {
+		// -------
 		// Deterministic offline test harness fallback when API key is not configured
+		// -------
 		pcm := GenerateFormantAudioPCM(chunkIdx * 320)
 		if onAudioFrame != nil {
 			return onAudioFrame(pcm)
@@ -122,7 +124,9 @@ func (c *CartesiaStreamingTTS) SynthesizeStream(ctx context.Context, text string
 	headers.Set("X-API-Key", c.apiKey)
 	headers.Set("Cartesia-Version", "2024-06-10")
 
+	// -------
 	// Convert http/https test server URLs to ws/wss if necessary
+	// -------
 	wsEndpoint := endpoint
 	if strings.HasPrefix(wsEndpoint, "http://") {
 		wsEndpoint = "ws://" + strings.TrimPrefix(wsEndpoint, "http://")
@@ -157,7 +161,9 @@ func (c *CartesiaStreamingTTS) SynthesizeStream(ctx context.Context, text string
 		c.mu.Unlock()
 	}()
 
+	// -------
 	// Asynchronous context cancellation watcher: immediately interrupts blocking WebSocket ReadMessage on cancellation / barge-in
+	// -------
 	cancelDone := make(chan struct{})
 	defer close(cancelDone)
 	go func() {
@@ -168,7 +174,9 @@ func (c *CartesiaStreamingTTS) SynthesizeStream(ctx context.Context, text string
 		}
 	}()
 
+	// -------
 	// Structured Cartesia WebSocket request frame
+	// -------
 	reqPayload := map[string]interface{}{
 		"model_id":   c.modelID,
 		"transcript": text,
@@ -193,7 +201,9 @@ func (c *CartesiaStreamingTTS) SynthesizeStream(ctx context.Context, text string
 	receivedFrames := 0
 	receivedDone := false
 
+	// -------
 	// Stream read loop: delivers audio frames incrementally to onAudioFrame callback
+	// -------
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()

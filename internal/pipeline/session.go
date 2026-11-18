@@ -27,12 +27,16 @@ func GenerateFormantAudioPCM(sampleOffset int) []byte {
 
 	for i := 0; i < numSamples; i++ {
 		t := float64(sampleOffset+i) / float64(sampleRate)
+		// -------
 		// Fundamental voice frequency (150Hz) + Formant 1 (500Hz) + Formant 2 (1500Hz)
+		// -------
 		sampleFloat := 0.5*math.Sin(2*math.Pi*150.0*t) +
 			0.3*math.Sin(2*math.Pi*500.0*t) +
 			0.2*math.Sin(2*math.Pi*1500.0*t)
 
+		// -------
 		// 16-bit signed PCM scaling (-32768 to 32767)
+		// -------
 		val := int16(sampleFloat * 16000.0)
 		buf[2*i] = byte(val & 0xFF)
 		buf[2*i+1] = byte((val >> 8) & 0xFF)
@@ -311,7 +315,9 @@ func (s *VoiceSession) handleUserSpeechEnd(silenceDetectedAt time.Time, speechDu
 	}
 	s.activeTurnMetrics = turnMetrics
 
+	// -------
 	// Cap turnHistory to 100 entries to prevent memory accumulation in prolonged calls
+	// -------
 	if len(s.turnHistory) >= 100 {
 		for k := range s.turnHistory {
 			delete(s.turnHistory, k)
@@ -349,7 +355,9 @@ func (s *VoiceSession) StartSpeakingTurnForBench() {
 		UserSilenceDetectedAt: time.Now(),
 	}
 
+	// -------
 	// Pre-fill audio buffer with speech chunks
+	// -------
 	for i := 0; i < 5; i++ {
 		chunk := &model.AudioChunk{
 			SessionID:  s.sessionID,
@@ -385,7 +393,9 @@ func (s *VoiceSession) StartLLMResponseStream(tokenStream <-chan string) {
 		return
 	}
 
+	// -------
 	// Sequential synthesis pipeline: guarantees strict in-order audio emission to telephony output
+	// -------
 	sentenceCh := make(chan queuedSentence, 64)
 
 	go func() {
@@ -470,7 +480,9 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		return
 	}
 
+	// -------
 	// Thread-safe read of configured TTS provider under mutex read lock
+	// -------
 	s.mu.RLock()
 	tts := s.ttsProvider
 	s.mu.RUnlock()
@@ -480,16 +492,22 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 
 	frameIdx := 0
 
+	// -------
 	// Stream audio incrementally frame-by-frame as received from TTS provider
+	// -------
 	err := tts.SynthesizeStream(ctx, chunk.Text, chunk.Index, func(pcmFrame []byte) error {
+		// -------
 		// Guard against stale turn generation or barge-in interruption while streaming
+		// -------
 		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 			return ctx.Err()
 		}
 
+		// -------
 		// Record accurate Time-to-First-Audio (TTFA) upon arrival of the very FIRST synthesized audio frame.
 		// Note: TTFA measures backend pipeline latency (user silence detection -> first synthesized PCM frame from TTS ready for transmission).
 		// Downstream network delivery and client jitter buffering are excluded.
+		// -------
 		s.mu.Lock()
 		if s.activeTurnMetrics != nil && s.activeTurnMetrics.FirstAudioReadyAt.IsZero() {
 			now := time.Now()
@@ -507,12 +525,16 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		}
 		s.mu.Unlock()
 
+		// -------
 		// Advance FSM to Speaking state upon arrival of first audio frame
+		// -------
 		if s.fsm.Is(model.StateThinking) {
 			_ = s.fsm.Transition(model.StateSpeaking)
 		}
 
+		// -------
 		// Calculate frame duration dynamically based on 16kHz, 16-bit mono linear PCM format (32 bytes per ms)
+		// -------
 		durationMs := len(pcmFrame) / 32
 		if durationMs == 0 && len(pcmFrame) > 0 {
 			durationMs = 1
@@ -529,7 +551,9 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 		}
 		frameIdx++
 
+		// -------
 		// Check generation before synthesis barrier hook
+		// -------
 		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -541,14 +565,18 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			hook(turnGen)
 		}
 
+		// -------
 		// Re-check turnGen under lock before the send attempt
+		// -------
 		s.mu.Lock()
 		if atomic.LoadUint64(&s.turnGen) != turnGen || ctx.Err() != nil {
 			s.mu.Unlock()
 			return ctx.Err()
 		}
 
+		// -------
 		// High watermark backpressure: drop oldest unconsumed packet if buffer exceeds 256 chunks
+		// -------
 		if len(s.audioOut) >= 256 {
 			select {
 			case <-s.audioOut:
@@ -556,7 +584,9 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			default:
 			}
 		}
+		// -------
 		// Unlock before channel send: never hold mutex across a blocking send
+		// -------
 		s.mu.Unlock()
 
 		s.mu.RLock()
@@ -566,8 +596,10 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 			postUnlock()
 		}
 
+		// -------
 		// Explicit pre-select guard: Go select pseudo-randomly chooses among ready cases
 		// when both channel send and <-ctx.Done() are simultaneously unblocked.
+		// -------
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -593,7 +625,9 @@ func (s *VoiceSession) synthesizeAndStream(ctx context.Context, chunk *model.Sen
 	if err != nil && ctx.Err() == nil {
 		logger.L.Error("streaming_synthesis_failed", "session_id", s.sessionID, "turn_id", chunk.TurnID, "error", err)
 
+		// -------
 		// Session-level mid-turn error handling: invalidate turn, drain output audio, reset to listening
+		// -------
 		s.mu.Lock()
 		atomic.AddUint64(&s.turnGen, 1)
 		if s.activeTurnCancel != nil {
@@ -638,10 +672,14 @@ func (s *VoiceSession) TriggerBargeIn() {
 		return
 	}
 
+	// -------
 	// Invalidate in-flight and future audio chunks from this turn
+	// -------
 	atomic.AddUint64(&s.turnGen, 1)
 
-	// 1. Immediately cancel the active turn context
+	// -------
+	// Immediately cancel the active turn context
+	// -------
 	if s.activeTurnCancel != nil {
 		s.activeTurnCancel()
 		s.activeTurnCancel = nil
@@ -651,7 +689,9 @@ func (s *VoiceSession) TriggerBargeIn() {
 		s.activeTurnMetrics.Interrupted = true
 	}
 
-	// 2. Non-blocking drain of unconsumed audio packets in output queue
+	// -------
+	// Non-blocking drain of unconsumed audio packets in output queue
+	// -------
 	drained := 0
 DrainLoop:
 	for {
@@ -665,7 +705,9 @@ DrainLoop:
 
 	s.mu.Unlock()
 
-	// 3. Atomically transition state to INTERRUPTED then LISTENING
+	// -------
+	// Atomically transition state to INTERRUPTED then LISTENING
+	// -------
 	_ = s.fsm.Transition(model.StateInterrupted)
 	_ = s.fsm.Transition(model.StateListening)
 
@@ -679,7 +721,9 @@ DrainLoop:
 		"drained_packets", drained,
 	)
 
-	// 4. Emit BargeIn notification so client telephony player halts local audio playback
+	// -------
+	// Emit BargeIn notification so client telephony player halts local audio playback
+	// -------
 	s.emitEvent(&model.TurnEvent{
 		Type:      model.EventBargeInTriggered,
 		SessionID: s.sessionID,

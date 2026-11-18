@@ -19,7 +19,9 @@ func TestFSMStateTransitions(t *testing.T) {
 		t.Fatalf("expected initial state IDLE, got %s", stateMachine.Current())
 	}
 
+	// -------
 	// Valid sequence: IDLE -> LISTENING -> THINKING -> SPEAKING -> DRAINING -> LISTENING
+	// -------
 	transitions := []model.ConversationState{
 		model.StateListening,
 		model.StateThinking,
@@ -37,7 +39,9 @@ func TestFSMStateTransitions(t *testing.T) {
 		}
 	}
 
+	// -------
 	// Invalid transition: LISTENING -> SPEAKING directly
+	// -------
 	err := stateMachine.Transition(model.StateSpeaking)
 	if err == nil {
 		t.Fatalf("expected error for invalid transition LISTENING -> SPEAKING, got nil")
@@ -82,7 +86,9 @@ func TestVADSilenceDetection(t *testing.T) {
 		t.Fatalf("expected speech start callback to fire")
 	}
 
+	// -------
 	// Feed unvoiced silence frames until hangover duration expires
+	// -------
 	time.Sleep(60 * time.Millisecond)
 	v.ProcessFrame(&model.AudioFrame{
 		Energy:   0.001,
@@ -125,7 +131,9 @@ func TestSentenceChunkerFirstChunkOptimization(t *testing.T) {
 		t.Fatalf("expected at least 2 sentence chunks, got %d", len(chunks))
 	}
 
+	// -------
 	// First chunk must have is_first_chunk = true
+	// -------
 	if !chunks[0].IsFirstChunk {
 		t.Errorf("expected first chunk to have IsFirstChunk = true")
 	}
@@ -145,7 +153,9 @@ func TestSub40msBargeInCancellation(t *testing.T) {
 	session := pipeline.NewVoiceSession("sess_bargein_test")
 	defer session.Close()
 
+	// -------
 	// Feed audio frames to simulate user turn completion
+	// -------
 	for i := 0; i < 3; i++ {
 		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
 	}
@@ -156,7 +166,9 @@ func TestSub40msBargeInCancellation(t *testing.T) {
 		t.Fatalf("expected state THINKING, got %s", session.State())
 	}
 
+	// -------
 	// Stream LLM tokens to trigger speech synthesis
+	// -------
 	tokenCh := make(chan string, 10)
 	tokenCh <- "Hello, "
 	tokenCh <- "how are you today? "
@@ -164,7 +176,6 @@ func TestSub40msBargeInCancellation(t *testing.T) {
 
 	session.StartLLMResponseStream(tokenCh)
 
-	// Wait for synthesis to transition into SPEAKING state
 	select {
 	case <-session.AudioOut():
 		// Received audio chunk
@@ -176,7 +187,9 @@ func TestSub40msBargeInCancellation(t *testing.T) {
 		t.Fatalf("expected state SPEAKING, got %s", session.State())
 	}
 
+	// -------
 	// Now trigger Barge-In (caller speaks while AI is speaking)
+	// -------
 	start := time.Now()
 	session.TriggerBargeIn()
 	latency := time.Since(start)
@@ -185,12 +198,16 @@ func TestSub40msBargeInCancellation(t *testing.T) {
 		t.Errorf("barge-in latency exceeded 40ms SLA: took %v", latency)
 	}
 
+	// -------
 	// State must immediately return to LISTENING
+	// -------
 	if session.State() != model.StateListening {
 		t.Fatalf("expected state LISTENING after barge-in, got %s", session.State())
 	}
 
+	// -------
 	// Audio out queue must be completely drained
+	// -------
 	select {
 	case chunk := <-session.AudioOut():
 		t.Fatalf("audio out queue was not drained: found leftover chunk %v", chunk)
@@ -219,7 +236,9 @@ func TestConcurrentVoiceSessions(t *testing.T) {
 				IsVoiced: true,
 			})
 
+			// -------
 			// Start LLM stream
+			// -------
 			toks := make(chan string, 2)
 			toks <- "Welcome. "
 			close(toks)
@@ -238,21 +257,24 @@ func TestVADAudioStreamBargeInDeadlockFree(t *testing.T) {
 	session := pipeline.NewVoiceSession("sess_vad_bargein_deadlock")
 	defer session.Close()
 
-	// 1. User speaks
+	// -------
+	// User speaks
+	// -------
 	for i := 0; i < 3; i++ {
 		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
 	}
 	time.Sleep(360 * time.Millisecond) // Silence hangover triggers thinking
 	_ = session.IngestAudio(&model.AudioFrame{Energy: 0.001, IsVoiced: false})
 
-	// 2. Stream tokens to enter speaking state
+	// -------
+	// Stream tokens to enter speaking state
+	// -------
 	tokens := make(chan string, 5)
 	tokens <- "Hello, "
 	tokens <- "I can help you with your reservation today. "
 	close(tokens)
 	session.StartLLMResponseStream(tokens)
 
-	// Wait for audio
 	select {
 	case <-session.AudioOut():
 	case <-time.After(500 * time.Millisecond):
@@ -263,18 +285,21 @@ func TestVADAudioStreamBargeInDeadlockFree(t *testing.T) {
 		t.Fatalf("expected state SPEAKING, got %s", session.State())
 	}
 
-	// 3. User interrupts by sending voiced audio frames (triggering VAD barge-in inside ProcessFrame)
+	// -------
+	// User interrupts by sending voiced audio frames (triggering VAD barge-in inside ProcessFrame)
+	// -------
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// Send 2 consecutive voiced frames to trigger OnBargeIn from within ProcessFrame
 		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.08, IsVoiced: true})
 		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.08, IsVoiced: true})
 	}()
 
 	select {
 	case <-done:
+		// -------
 		// Success: no deadlock!
+		// -------
 	case <-time.After(1 * time.Second):
 		t.Fatalf("DEADLOCK DETECTED: IngestAudio hung while triggering VAD barge-in")
 	}
@@ -294,7 +319,9 @@ func TestSentenceChunkerAbbreviationAndEllipsis(t *testing.T) {
 		chunks = append(chunks, chunk)
 	})
 
+	// -------
 	// Stream text containing honorific abbreviation "Dr." and currency with comma "$5,000"
+	// -------
 	tokens := []string{"Hello, ", "please ", "meet ", "Dr. ", "Smith ", "at ", "the ", "clinic. ", "The total cost is $5,000 in cash."}
 	for _, tok := range tokens {
 		sc.IngestToken(tok)
@@ -304,7 +331,9 @@ func TestSentenceChunkerAbbreviationAndEllipsis(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// -------
 	// It should NOT have split on "Dr." or "$5,000"
+	// -------
 	for _, c := range chunks {
 		if c.Text == "Dr." || c.Text == "please meet Dr." {
 			t.Errorf("unexpected split at honorific abbreviation: %s", c.Text)
@@ -351,7 +380,9 @@ ReceiveLoop:
 		t.Fatalf("expected at least 2 chunks, got %d", len(receivedIndices))
 	}
 
+	// -------
 	// Verify monotonic index ordering: [0, 1, 2...]
+	// -------
 	for i := 1; i < len(receivedIndices); i++ {
 		if receivedIndices[i] <= receivedIndices[i-1] {
 			t.Errorf("out-of-order audio chunk detected: received %v", receivedIndices)
@@ -363,7 +394,9 @@ func TestEndToEndBargeInPipelineLatency(t *testing.T) {
 	session := pipeline.NewVoiceSession("sess_e2e_bargein")
 	defer session.Close()
 
-	// 1. Advance session to SPEAKING state
+	// -------
+	// Advance session to SPEAKING state
+	// -------
 	for i := 0; i < 3; i++ {
 		_ = session.IngestAudio(&model.AudioFrame{Energy: 0.05, IsVoiced: true})
 	}
@@ -376,7 +409,6 @@ func TestEndToEndBargeInPipelineLatency(t *testing.T) {
 	close(tokens)
 	session.StartLLMResponseStream(tokens)
 
-	// Wait for audio synthesis
 	select {
 	case <-session.AudioOut():
 	case <-time.After(1 * time.Second):
@@ -387,18 +419,26 @@ func TestEndToEndBargeInPipelineLatency(t *testing.T) {
 		t.Fatalf("expected state SPEAKING, got %s", session.State())
 	}
 
-	// 2. Synthesize raw 16-bit linear PCM audio frame (20ms @ 16kHz = 640 bytes)
+	// -------
+	// Synthesize raw 16-bit linear PCM audio frame (20ms @ 16kHz = 640 bytes)
+	// -------
 	pcm := make([]byte, 640)
 	for i := 0; i < len(pcm); i += 2 {
 		pcm[i] = 0x00
 		pcm[i+1] = 0x25 // Generates RMS energy ~0.07 > 0.02 threshold
 	}
 
-	// 3. Measure complete end-to-end barge-in latency from caller speech frame arrival
+	// -------
+	// Measure complete end-to-end barge-in latency from caller speech frame arrival
+	// -------
+	// -------
 	// through RMS -> VAD -> FSM Interruption -> Context Cancel -> Audio Buffer Drain -> Event Emission
+	// -------
 	t0 := time.Now()
 
+	// -------
 	// First voiced frame increments consecutive counter
+	// -------
 	_ = session.IngestAudio(&model.AudioFrame{Data: pcm})
 	// Second voiced frame triggers Barge-In
 	_ = session.IngestAudio(&model.AudioFrame{Data: pcm})
@@ -435,7 +475,9 @@ EventLoop:
 		t.Errorf("expected EventBargeInTriggered event")
 	}
 
+	// -------
 	// Verify audio output queue was completely drained
+	// -------
 	select {
 	case leftover := <-session.AudioOut():
 		t.Errorf("audio queue was not drained: found chunk %v", leftover)
@@ -454,7 +496,9 @@ func TestWebSocketSessionReconnectRecovery(t *testing.T) {
 	// Ingest audio
 	_ = sess.IngestAudio(&model.AudioFrame{Energy: 0.06, IsVoiced: true})
 
-	// 1. Simulate mobile network drop: client disconnects
+	// -------
+	// Simulate mobile network drop: client disconnects
+	// -------
 	sess.MarkDetached()
 
 	isDetached, dur := sess.IsDetached()
@@ -465,13 +509,17 @@ func TestWebSocketSessionReconnectRecovery(t *testing.T) {
 		t.Errorf("expected detachment duration near 0, got %v", dur)
 	}
 
+	// -------
 	// Session must still be available in manager for reconnection
+	// -------
 	savedSess, ok := mgr.Get(sessionID)
 	if !ok || savedSess == nil {
 		t.Fatalf("expected session to be preserved in manager during grace window")
 	}
 
-	// 2. Client reconnects within grace window
+	// -------
+	// Client reconnects within grace window
+	// -------
 	reconnectedSess := mgr.GetOrCreate(sessionID)
 	reconnectedSess.MarkAttached()
 
@@ -484,7 +532,9 @@ func TestWebSocketSessionReconnectRecovery(t *testing.T) {
 		t.Errorf("expected session to be active, not detached")
 	}
 
+	// -------
 	// Conversation state must be seamlessly preserved
+	// -------
 	if reconnectedSess.State() != sess.State() {
 		t.Errorf("expected state %s, got %s", sess.State(), reconnectedSess.State())
 	}
@@ -499,7 +549,9 @@ func TestStaleAudioDroppedAfterBargeIn(t *testing.T) {
 	// Start speaking turn with initial audio
 	session.StartSpeakingTurnForBench()
 
+	// -------
 	// Start LLM stream with delayed synthesis
+	// -------
 	session.StartLLMResponseStream(tokenCh)
 	tokenCh <- "First"
 	tokenCh <- " sentence"
@@ -518,7 +570,9 @@ func TestStaleAudioDroppedAfterBargeIn(t *testing.T) {
 	// Allow background workers to finish
 	time.Sleep(50 * time.Millisecond)
 
+	// -------
 	// Stale audio chunks from the cancelled turn generation must NOT be in audioOut
+	// -------
 	select {
 	case chunk := <-session.AudioOut():
 		t.Fatalf("stale audio chunk detected in output queue after barge-in: turn=%s, idx=%d", chunk.TurnID, chunk.ChunkIdx)
@@ -533,7 +587,9 @@ func TestBargeInInIdleOrListeningNoOp(t *testing.T) {
 	session := pipeline.NewVoiceSession("sess_bargein_noop")
 	defer session.Close()
 
-	// 1. Listening state (default initial state of VoiceSession)
+	// -------
+	// Listening state (default initial state of VoiceSession)
+	// -------
 	if session.State() != model.StateListening {
 		t.Fatalf("expected state LISTENING, got %s", session.State())
 	}
@@ -546,15 +602,21 @@ func TestBargeInInIdleOrListeningNoOp(t *testing.T) {
 		t.Fatalf("expected turn generation to remain %d, got %d", genBeforeListening, session.TurnGeneration())
 	}
 
-	// 2. Idle state (verified via FSM in Idle)
+	// -------
+	// Idle state (verified via FSM in Idle)
+	// -------
 	idleSession := pipeline.NewVoiceSession("sess_bargein_idle")
 	defer idleSession.Close()
+	// -------
 	// Create an un-transitioned FSM to test Idle state safety
+	// -------
 	idleFSM := fsm.NewTurnFSM("sess_bargein_idle")
 	if idleFSM.Current() != model.StateIdle {
 		t.Fatalf("expected raw FSM state to be IDLE, got %s", idleFSM.Current())
 	}
+	// -------
 	// Calling TriggerBargeIn on session while in Idle or Listening must never panic or corrupt state
+	// -------
 	idleSession.TriggerBargeIn()
 	if idleSession.State() != model.StateListening {
 		t.Fatalf("expected session state LISTENING, got %s", idleSession.State())
@@ -574,14 +636,18 @@ func TestBargeInRaceWithConcurrentAudioSynthesis(t *testing.T) {
 	var bargeInDone sync.WaitGroup
 	var interruptedGen uint64
 
+	// -------
 	// Barrier hook forces barge-in precisely between generation check and enqueue
+	// -------
 	session.SetSynthesisBarrierHook(func(turnGen uint64) {
 		interruptedGen = turnGen
 		session.TriggerBargeIn()
 		bargeInDone.Done()
 	})
 
+	// -------
 	// Start speaking turn so session is in active StateSpeaking with turn context
+	// -------
 	session.StartSpeakingTurnForBench()
 
 	tokenCh := make(chan string, 1)
@@ -591,13 +657,14 @@ func TestBargeInRaceWithConcurrentAudioSynthesis(t *testing.T) {
 	tokenCh <- "Synthesizing audio frame that will be interrupted."
 	close(tokenCh)
 
-	// Wait for barrier hook to execute TriggerBargeIn and complete
 	bargeInDone.Wait()
 
 	// Allow any concurrent goroutine to settle
 	time.Sleep(30 * time.Millisecond)
 
+	// -------
 	// Invariant: after TriggerBargeIn returns, no frame from the previous turn is delivered
+	// -------
 	select {
 	case chunk := <-session.AudioOut():
 		if chunk.Generation <= interruptedGen {
@@ -626,8 +693,10 @@ DrainInitial:
 		}
 	}
 
+	// -------
 	// Hook runs after mutex is unlocked but before select.
 	// It triggers barge-in / cancels turn context. Both <-ctx.Done() and s.audioOut <- audioChunk are ready.
+	// -------
 	session.SetPostUnlockHook(func() {
 		session.TriggerBargeIn()
 	})
@@ -637,10 +706,11 @@ DrainInitial:
 	tokenCh <- "Testing cancelled context select safety."
 	close(tokenCh)
 
-	// Wait briefly for worker to complete
 	time.Sleep(10 * time.Millisecond)
 
+	// -------
 	// Verify zero chunks from that turn entered the channel
+	// -------
 	select {
 	case chunk := <-session.AudioOut():
 		t.Fatalf("INVARIANT VIOLATION: chunk enqueued into audioOut despite cancelled context! (turn=%s, idx=%d)",

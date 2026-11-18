@@ -108,8 +108,9 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 		currState = v.fsm.Current()
 	}
 
-	// 1. Barge-In Interruption Detection:
-	// Caller speaks while AI is Thinking, Speaking, or Draining
+	// -------
+	// Barge-in interruption detection: caller speaks while AI is thinking, speaking, or draining
+	// -------
 	if (currState == model.StateSpeaking || currState == model.StateThinking || currState == model.StateDraining) && isVoiced {
 		v.consecVoiced++
 		if v.consecVoiced >= v.cfg.BargeInMinFrames {
@@ -129,7 +130,9 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 			eventTime = now
 		}
 	} else if isVoiced {
-		// 2. Normal Turn-Taking Processing in LISTENING state
+		// -------
+		// Normal Turn-Taking Processing in LISTENING state
+		// -------
 		v.consecVoiced++
 		v.consecUnvoiced = 0
 		v.lastVoicedTime = now
@@ -145,7 +148,6 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 		v.consecVoiced = 0
 
 		if v.isSpeaking {
-			// Check if silence hangover exceeded
 			silenceDuration := now.Sub(v.lastVoicedTime)
 			if silenceDuration >= v.cfg.SilenceHangover {
 				v.isSpeaking = false
@@ -168,8 +170,10 @@ func (v *VoiceActivityDetector) ProcessFrame(frame *model.AudioFrame) {
 	}
 	v.mu.Unlock()
 
+	// -------
 	// Invoke callbacks outside the lock to prevent re-entrant deadlocks
 	// (e.g. OnBargeIn -> TriggerBargeIn -> vad.Reset() acquiring v.mu.Lock())
+	// -------
 	if fireBargeIn && v.callbacks.OnBargeIn != nil {
 		v.callbacks.OnBargeIn(eventTime)
 	}

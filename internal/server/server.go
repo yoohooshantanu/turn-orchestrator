@@ -35,12 +35,16 @@ func RunEmitter(ctx context.Context, session *pipeline.VoiceSession, writer WSWr
 			if !ok {
 				return nil
 			}
+			// -------
 			// Drop mismatched/stale turn generations at send time:
 			// Invariant: after TriggerBargeIn returns, no frame from a superseded turn is delivered over WebSocket.
+			// -------
 			if chunk.Generation != session.TurnGeneration() {
 				continue
 			}
+			// -------
 			// Transmit raw PCM audio chunk bytes directly to client
+			// -------
 			if err := writer.WriteMessage(websocket.BinaryMessage, chunk.Data); err != nil {
 				return err
 			}
@@ -63,13 +67,17 @@ func checkAuth(r *http.Request) bool {
 	isProd := os.Getenv("ENV") == "production" || os.Getenv("VOCALFLOW_ENV") == "production" || os.Getenv("REQUIRE_AUTH") == "true"
 	expectedToken := os.Getenv("AUTH_TOKEN")
 
+	// -------
 	// Fail-closed security guard: in production or when auth is required, an unset AUTH_TOKEN denies all access
+	// -------
 	if isProd && expectedToken == "" {
 		logger.L.Error("auth_failed_closed_missing_auth_token_config")
 		return false
 	}
 
+	// -------
 	// Local development mode: allow unauthenticated traffic only if explicitly unconfigured and not in production
+	// -------
 	if expectedToken == "" {
 		return true
 	}
@@ -82,7 +90,9 @@ func checkAuth(r *http.Request) bool {
 		}
 	}
 
+	// -------
 	// Query-string tokens (?token=...) are strictly rejected to prevent credential leaks into logs
+	// -------
 	return false
 }
 
@@ -93,7 +103,9 @@ func MakeUpgrader() websocket.Upgrader {
 		WriteBufferSize: 4096,
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
+			// -------
 			// Allow direct clients, telephony trunks, or tests with no Origin header
+			// -------
 			if origin == "" {
 				return true
 			}
@@ -107,7 +119,9 @@ func MakeUpgrader() websocket.Upgrader {
 				}
 				return false
 			}
+			// -------
 			// Secure default: enforce same-origin (RFC 6454) or standard localhost
+			// -------
 			u, err := url.Parse(origin)
 			if err != nil {
 				return false
@@ -128,7 +142,9 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 	upgrader := MakeUpgrader()
 	mux := http.NewServeMux()
 
-	// 1. Session Lifecycle API
+	// -------
+	// Session Lifecycle API
+	// -------
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if r.Method != http.MethodPost {
@@ -155,7 +171,9 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 		})
 	})
 
-	// 2. Full-Duplex Binary & Text WebSocket Conversational Gateway
+	// -------
+	// Full-Duplex Binary & Text WebSocket Conversational Gateway
+	// -------
 	mux.HandleFunc("/ws/voice/", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		if len(parts) < 3 || parts[0] != "ws" || parts[1] != "voice" {
@@ -179,25 +197,33 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 		session := mgr.GetOrCreate(sessionID)
 		session.MarkAttached()
 
+		// -------
 		// On disconnect, mark detached with 60s grace period for reconnect recovery
+		// -------
 		defer session.MarkDetached()
 
 		clientCtx, clientCancel := context.WithCancel(r.Context())
 		defer clientCancel()
 
+		// -------
 		// Emitter loop: Push binary audio frames and control events to telephony client
+		// -------
 		go func() {
 			_ = RunEmitter(clientCtx, session, conn)
 		}()
 
+		// -------
 		// Ingestion loop: Receive raw PCM binary audio or control frames from telephony client
+		// -------
 		for {
 			messageType, payload, err := conn.ReadMessage()
 			if err != nil {
 				break
 			}
 
+			// -------
 			// Binary Frame: Ingest raw 16-bit linear PCM audio bytes (16kHz mono)
+			// -------
 			if messageType == websocket.BinaryMessage {
 				if len(payload) > 0 {
 					energy := vad.ComputeRMSEnergy(payload)
@@ -240,7 +266,9 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 		}
 	})
 
-	// 3. Telemetry & Health Check Endpoints
+	// -------
+	// Telemetry & Health Check Endpoints
+	// -------
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -251,7 +279,9 @@ func NewServerHandler(mgr *pipeline.SessionManager) http.Handler {
 	})
 	mux.HandleFunc("/metrics", metrics.DefaultMetrics.Handler())
 
-	// 4. pprof profiling
+	// -------
+	// pprof profiling
+	// -------
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 

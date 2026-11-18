@@ -14,12 +14,16 @@ import (
 )
 
 func init() {
+	// -------
 	// Silence verbose logger output during benchmarks
+	// -------
 	logger.L = slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
 func BenchmarkRMSEnergyCalculation(b *testing.B) {
+	// -------
 	// Standard 20ms audio frame at 16kHz 16-bit mono = 640 bytes
+	// -------
 	pcm := make([]byte, 640)
 	_, _ = rand.Read(pcm)
 
@@ -108,7 +112,9 @@ func BenchmarkEndToEndBargeInPipeline(b *testing.B) {
 		sess.StartSpeakingTurnForBench()
 		b.StartTimer()
 
+		// -------
 		// Feed consecutive voiced PCM frames through VAD to trigger Barge-In
+		// -------
 		_ = sess.IngestAudio(&model.AudioFrame{Data: pcm})
 		_ = sess.IngestAudio(&model.AudioFrame{Data: pcm})
 	}

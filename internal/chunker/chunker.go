@@ -54,8 +54,10 @@ func (c *SentenceChunker) IngestToken(token string) {
 		return
 	}
 
+	// -------
 	// First chunk optimization: split aggressively on clause boundary (comma, semicolon, colon)
 	// after at least 3 words to achieve ultra-low Time-to-First-Audio (<250ms)
+	// -------
 	if c.isFirstChunk && c.wordCount >= 3 {
 		if idx := findClauseBoundary(currentText); idx != -1 {
 			chunkText := strings.TrimSpace(currentText[:idx+1])
@@ -69,7 +71,9 @@ func (c *SentenceChunker) IngestToken(token string) {
 		}
 	}
 
+	// -------
 	// Normal sentence boundary detection: '.', '!', '?', '\n'
+	// -------
 	if idx := findSentenceBoundary(currentText); idx != -1 {
 		chunkText := strings.TrimSpace(currentText[:idx+1])
 		remaining := currentText[idx+1:]
@@ -81,8 +85,10 @@ func (c *SentenceChunker) IngestToken(token string) {
 		return
 	}
 
+	// -------
 	// Safety cap: if an LLM generates a runaway sentence with > 25 words without punctuation,
 	// force a chunk at the latest word boundary to avoid high latency
+	// -------
 	if c.wordCount >= 25 {
 		if lastSpace := strings.LastIndex(currentText, " "); lastSpace != -1 {
 			chunkText := strings.TrimSpace(currentText[:lastSpace])
@@ -146,15 +152,21 @@ func (c *SentenceChunker) emitChunk(text string, isFinal bool) {
 func findSentenceBoundary(s string) int {
 	for i, r := range s {
 		if r == '.' || r == '!' || r == '?' || r == '\n' {
-			// 1. Skip ellipsis: if followed by another dot, do not split
+			// -------
+			// Skip ellipsis: if followed by another dot, do not split
+			// -------
 			if r == '.' && i+1 < len(s) && s[i+1] == '.' {
 				continue
 			}
-			// 2. Ensure it's not a common decimal number (e.g. "3.14")
+			// -------
+			// Ensure it's not a common decimal number (e.g. "3.14")
+			// -------
 			if i+1 < len(s) && unicode.IsDigit(rune(s[i+1])) {
 				continue
 			}
-			// 3. Skip common honorific abbreviations (e.g. "Dr.", "Mr.", "Mrs.")
+			// -------
+			// Skip common honorific abbreviations (e.g. "Dr.", "Mr.", "Mrs.")
+			// -------
 			if r == '.' && isAbbreviation(s[:i]) {
 				continue
 			}
@@ -179,7 +191,9 @@ func isAbbreviation(prefix string) bool {
 
 func findClauseBoundary(s string) int {
 	for i, r := range s {
+		// -------
 		// Skip comma within numeric formatting (e.g. "$10,000")
+		// -------
 		if r == ',' && i > 0 && i+1 < len(s) && unicode.IsDigit(rune(s[i-1])) && unicode.IsDigit(rune(s[i+1])) {
 			continue
 		}

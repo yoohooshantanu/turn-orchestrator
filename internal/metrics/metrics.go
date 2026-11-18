@@ -17,7 +17,9 @@ type Metrics struct {
 	TotalTokensStreamed uint64
 	TotalSentences      uint64
 
+	// -------
 	// Sub-millisecond latency trackers in microseconds
+	// -------
 	sumTTFAUs      uint64
 	countTTFA      uint64
 	sumBargeInUs   uint64
