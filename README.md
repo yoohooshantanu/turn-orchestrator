@@ -143,7 +143,7 @@ case chunk, ok := <-session.AudioOut():
 
 `TestDeterministicStaleAudioBarrier` and `TestStaleAudioDroppedAfterBargeIn` verify that even when multiple synthesis routines race with an interrupt, zero stale frames reach the client.
 
-### 2. Sub-50ms Barge-In Cancellation
+### 2. Barge-In Cancellation
 
 `TriggerBargeIn` executes four atomic steps:
 1. Increments `turnGen` under mutex.
@@ -293,12 +293,12 @@ Prometheus metrics exposed at `GET /metrics`:
 | Area | Tests | Invariants Verified |
 | :--- | :--- | :--- |
 | **FSM** | `TestFSMStateTransitions` | Enforces valid transitions (`IDLE→LISTENING→THINKING→SPEAKING→DRAINING→LISTENING`); rejects illegal transitions. |
-| **VAD** | `TestVADSilenceDetection`, `TestVADAudioStreamBargeInDeadlockFree` | Validates speech start/stop callback timing and verifies thread safety across 100 concurrent workers. |
+| **VAD** | `TestVADSilenceDetection`, `TestVADAudioStreamBargeInDeadlockFree` | Validates speech start/stop callback timing and verifies that audio stream barge-in does not deadlock. |
 | **Chunker** | `TestSentenceChunkerFirstChunkOptimization`, `TestSentenceChunkerAbbreviationAndEllipsis` | Validates clause splitting for early chunks while guarding abbreviations (`Dr.`, `e.g.`, `3.14`). |
-| **Barge-in** | `TestSub40msBargeInCancellation`, `TestBargeInInIdleOrListeningNoOp`, `TestBargeInRaceWithConcurrentAudioSynthesis` | Verifies cancellation latency bounds and validates 50 concurrent synthesizing goroutines during interrupt. |
+| **Barge-in** | `TestSub40msBargeInCancellation`, `TestBargeInInIdleOrListeningNoOp`, `TestBargeInRaceWithConcurrentAudioSynthesis` | Verifies cancellation latency bounds and uses a barrier hook to force an interrupt between generation check and enqueue. |
 | **Stale Audio** | `TestStaleAudioDroppedAfterBargeIn`, `TestDeterministicStaleAudioBarrier` | Verifies generation counter barrier discards all post-interrupt audio frames. |
 | **Pipeline** | `TestEndToEndBargeInPipelineLatency`, `TestCancelledContextNeverEnqueuesAudioWithBufferSpace` | Exercises end-to-end event chain and checks that cancelled contexts halt enqueueing. |
-| **Sessions** | `TestConcurrentVoiceSessions`, `TestStrictAudioChunkSequentialOrdering` | Validates isolation across 20 simultaneous sessions and strict monotonic frame sequence delivery. |
+| **Sessions** | `TestConcurrentVoiceSessions`, `TestStrictAudioChunkSequentialOrdering` | Validates isolation across 25 simultaneous sessions and strict monotonic frame sequence delivery. |
 | **WebSocket** | `TestWebSocketFullDuplexLiveAudio`, `TestWebSocketIncrementalTTSStreamingPipeline`, `TestWebSocketSessionReconnectRecovery` | Verifies binary round-trips, incremental TTS streaming, and 60-second detachment recovery. |
 | **Security** | `TestWebSocketOriginSecurityValidation`, `TestWebSocketAuthentication`, `TestWebSocketFailClosedSecurity` | Rejects cross-origin requests, invalid tokens, and query parameter credentials. |
 | **TTS Adapters** | `TestFormantWaveformSynthesis`, `TestCartesiaProviderLifecycleAndFallback`, `TestTimeToFirstAudioMeasurementWithDelayedProvider`, `TestTTSProviderEnvironmentConfiguration` | Exercises Cartesia streaming client, formant test harness fallback, and provider error handling. |
@@ -328,7 +328,7 @@ SentenceChunker-8                 36.70µ ± 86%   672 B      17.0
 - **`TriggerBargeInDirect` (~24 µs):** The raw cancellation cost: mutex acquisition, atomic counter increment, context cancellation, non-blocking channel drain loop, and two FSM transitions.
 - **`BargeInCancellationLatency` (~22 µs):** Window between barge-in trigger and total stale frame invalidation.
 - **`EndToEndBargeInPipeline` (~41.5 µs):** End-to-end path from raw PCM input through RMS energy calculation, 2-frame VAD detection, barge-in invocation, and event emission.
-- **`RMSEnergyCalculation` (7.77 µs, 0 allocs):** Zero-allocation hot path running pure integer arithmetic on the stack.
+- **`RMSEnergyCalculation` (7.77 µs, 0 allocs):** Zero-allocation hot path on the stack, computing RMS energy and calling math.Sqrt with zero heap allocations.
 
 ---
 
