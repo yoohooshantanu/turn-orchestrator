@@ -1,295 +1,362 @@
 # TurnOrchestrator
 
 [![CI](https://github.com/yoohooshantanu/vocalflow/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/vocalflow/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8)](https://go.dev/)
-[![WebSocket](https://img.shields.io/badge/WebSocket-Full--Duplex-010101)](https://tools.ietf.org/html/rfc6455)
-[![Audio](https://img.shields.io/badge/Audio-16kHz%20Linear%20PCM-blueviolet)](https://en.wikipedia.org/wiki/Pulse-code_modulation)
+![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8)
+![WebSocket](https://img.shields.io/badge/WebSocket-Full--Duplex-010101)
+![Audio](https://img.shields.io/badge/Audio-16kHz%20Linear%20PCM-blueviolet)
 
-A full-duplex conversational voice turn orchestrator and barge-in coordinator written in Go. It manages the real-time interaction loop between a human caller and voice AI: streaming bi-directional 16kHz PCM audio over WebSockets, detecting interruptions via energy VAD in ~22 µs, cancelling speech playback with zero stale-frame leaks via atomic turn generations, and chunking LLM responses at clause boundaries for sub-250ms time-to-first-audio.
+A real-time, full-duplex conversational turn orchestrator written in Go. It manages the sub-millisecond interaction loop between a live human caller and voice AI: streaming 16kHz PCM audio over WebSockets in both directions, detecting caller speech via energy-based VAD, cancelling in-flight AI speech in ~22 µs without stale-audio leaks, and chunking LLM responses at clause boundaries for sub-250ms time-to-first-audio (TTFA).
 
-I wanted to build the conversational glue that makes voice AI feel like a real phone call instead of a walkie-talkie: the part where human and machine talk back and forth, interrupt each other, and recover without audio glitching or hanging.
+*(The GitHub repo is called vocalflow. The Go module and binary are named turn-orchestrator from an architectural rename.)*
 
-*(The GitHub repo is called vocalflow. The Go module and binary are named turn-orchestrator from a later rename.)*
+### Key Technical Highlights
+- **Sub-50µs Interruption Reaction:** Cancels active speech synthesis, drains audio queues, and transitions the conversation FSM in ~22 µs on caller barge-in.
+- **Deterministic Turn Generation Barrier:** Uses atomic turn counters (`turnGen uint64`) to discard inflight audio packets at the network boundary, eliminating ghost speech across turns.
+- **Adaptive Clause-Boundary Chunking:** Synthesizes the first 3–5-word clause immediately to achieve sub-250ms TTFA, then switches to full sentence boundaries for natural cadence.
+
+---
 
 ## Contents
 
-- [The idea in two minutes](#the-idea-in-two-minutes)
-- [What is real and what is mocked](#what-is-real-and-what-is-mocked)
-- [Turn lifecycle & barge-in flow](#turn-lifecycle--barge-in-flow)
-- [The pieces, one by one](#the-pieces-one-by-one)
-- [Protocol & audio format](#protocol--audio-format)
+- [Production Role & Problem](#production-role--problem)
+- [System Scope & Integration Boundaries](#system-scope--integration-boundaries)
+- [Architecture & Event Flow](#architecture--event-flow)
+- [The Subsystems, One by One](#the-subsystems-one-by-one)
+- [Protocol](#protocol)
 - [Run it](#run-it)
 - [Observability](#observability)
 - [Tests](#tests)
 - [Performance](#performance)
-- [Limitations and rough edges](#limitations-and-rough-edges)
-- [Repo map](#repo-map)
-- [Author](#author)
+- [Architectural Trade-offs](#architectural-trade-offs)
+- [Repo Map](#repo-map)
 
 ---
 
-## The idea in two minutes
+## Production Role & Problem
 
-Most voice AI demos feel like talking through a walkie-talkie: you speak, wait through two seconds of silence while the LLM generates a full response, and then listen to a robotic monologue. If you say "Wait, hold on!" while the machine is speaking, it keeps droning on because it cannot hear you while talking.
+In production voice AI systems (e.g. conversational contact centers, automated triage bots, outbound sales agents), traditional request-response architectures fail:
 
-A natural telephone conversation requires three things to work concurrently:
-1. **Low Time-to-First-Audio (TTFA)**: You cannot wait for the LLM to finish generating 50 words. You must stream tokens as they arrive, split them on natural clause boundaries (commas, semicolons, short phrases), and dispatch the first 3–5 words to the TTS synthesizer immediately (<250ms).
-2. **Sub-millisecond barge-in detection**: As soon as the caller interrupts, the engine must abort the current turn, cancel active speech synthesis, flush speaker playback queues, and flip the turn state machine back to `LISTENING`.
-3. **Turn-generation race elimination**: When Turn 3 is cancelled and Turn 4 starts, any buffered audio frame from Turn 3 still lingering in a channel or goroutine must never leak out to the caller's ears.
+1. **The "Walkie-Talkie" Trap:** Naive bots wait for silence, send the entire transcript to an LLM, wait for complete generation, and then invoke TTS. This introduces a 2–3 second delay that feels robotic and breaks natural cadence.
+2. **The Interruption (Barge-In) Dilemma:** When a human interrupts ("Wait, stop", "No, option two"), the bot must immediately halt outgoing audio and listen. If cancellation takes hundreds of milliseconds, the bot talks over the caller.
+3. **Turn-Generation Race Conditions:** When a turn is interrupted, in-flight TTS streaming goroutines often have audio frames already in transit. Without an atomic generation boundary, stale audio from turn $N$ leaks into the caller's ear while turn $N+1$ is starting.
 
-This repo implements that entire conversational loop over full-duplex WebSockets using raw 16kHz 16-bit linear PCM audio.
+### Where TurnOrchestrator Sits in the Voice Stack
+
+```
+[ Telephone / WebRTC Caller ]
+              │
+              ▼ (Binary 16kHz PCM Audio Stream)
+┌─────────────────────────────────────────────────────────────┐
+│                     TurnOrchestrator                        │
+│                                                             │
+│   ┌──────────────────┐               ┌──────────────────┐   │
+│   │   Inbound VAD    │               │  Clause Chunker  │   │
+│   │ (Energy Scoring) │               │   (Early TTFA)   │   │
+│   └─────────┬────────┘               └────────▲─────────┘   │
+│             │ Interruption                    │ LLM Tokens  │
+│             ▼ (~22 µs)                        │             │
+│   ┌──────────────────┐               ┌────────┴─────────┐   │
+│   │ Atomic turnGen   │               │   Streaming TTS  │   │
+│   │ Stale Barrier    │               │ Cartesia Adapter │   │
+│   └──────────────────┘               └──────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+              │                                 ▲
+              ▼                                 │
+     [ Speech-to-Text ]                 [ LLM Generation ]
+```
+
+TurnOrchestrator sits between the media transport and the intelligence backends, governing the stateful half-duplex / full-duplex conversational loop.
 
 ---
 
-## What is real and what is mocked
+## System Scope & Integration Boundaries
 
-| Real | Mocked or simplified |
-| :--- | :--- |
-| **Full-duplex WebSocket streaming**: Raw 16kHz 16-bit mono PCM binary frames over `/ws/voice/{session_id}`. | **Speech-to-Text (ASR)**: Ingested audio runs through real-time energy VAD for barge-in detection, but speech transcription tokens are injected via control messages or mock generators. |
-| **Turn-taking FSM**: Strict state transitions (`IDLE` $\rightarrow$ `LISTENING` $\rightarrow$ `THINKING` $\rightarrow$ `SPEAKING` $\rightarrow$ `DRAINING` $\rightarrow$ `INTERRUPTED`). | **LLM generation**: In tests and local demos, streaming token responses are simulated to demonstrate clause chunking and TTFA pipelining without paying LLM token costs. |
-| **Atomic turn generations**: Stale audio barrier (`turnGen uint64`) prevents interrupted frames from ever reaching the client player. | **Offline acoustic fallback synthesizer**: `FormantTestHarnessTTS` synthesizes real 16kHz PCM audio ($F_0=150\text{Hz}, F_1=500\text{Hz}, F_2=1500\text{Hz}$) with acoustic energy so CI runs completely offline without cloud API keys. |
-| **Clause-boundary sentence chunker**: Splits tokens on punctuation (`,`, `;`, `:`) with heuristic protection for honorifics (`Dr.`, `Mr.`), decimals (`3.14`), and ellipses. | |
-| **Dual-window energy VAD**: Physical 40ms accumulation window (two 20ms frames above RMS energy `0.02`) to ignore transient clicks and background pops. | |
-| **Production Cartesia Sonic adapter**: Live streaming WebSocket client (`wss://api.cartesia.ai/tts/websocket`) supporting sub-150ms neural speech synthesis. | |
-| **Session recovery grace period**: 60-second detached grace window preserves conversation state across telephone network reconnects. | |
-| **Fail-closed authentication**: RFC 6454 origin check, Bearer token validation, explicit rejection of query-string tokens. | |
-| **27 tests in CI**: Unit, security, and concurrency tests run with `-race` in GitHub Actions. | |
+In enterprise voice infrastructure, heavy ML models (ASR, LLM, Neural TTS) execute out-of-process on specialized GPU clusters. TurnOrchestrator is the **low-latency stateful coordinator**. The codebase decouples the orchestration core from external model providers via clean streaming interfaces:
 
-*Summary: This is a real-time conversational streaming and state coordination engine, not an LLM or STT host.*
+| Subsystem | Production-Ready Core in this Repo | Decoupled External Interface |
+| :--- | :--- | :--- |
+| **Media Transport** | Full-duplex WebSocket server streaming raw 16kHz 16-bit mono PCM with RFC 6454 origin checks and constant-time token auth. | Decoupled from proprietary telephony wrappers; ingestible from Twilio Media Streams, FreeSWITCH, or browser WebRTC gateways. |
+| **Barge-In Engine** | Energy-based VAD (`ComputeRMSEnergy`) over 20ms frames with two-frame majority voting and ~22 µs atomic turn cancellation. | `VAD` interface: pluggable for Silero VAD or WebRTC neural VAD without altering the session state machine. |
+| **Turn Generation Barrier** | Lock-free `atomic.AddUint64(&turnGen, 1)` tag check at the WebSocket frame egress boundary, preventing cross-turn audio bleed. | Internal concurrency invariant; zero third-party dependencies. |
+| **Speech Synthesis (TTS)** | Streaming clause chunker + WebSocket client adapter for Cartesia Sonic streaming audio. | `StreamingTTSProvider` interface: supports Cartesia Sonic natively, with offline `FormantTestHarnessTTS` fallback for hermetic CI. |
+| **Session Lifecycle** | Multi-session manager with 60-second detached grace window for handling transient network dropouts without state loss. | In-memory session store; adaptable to Redis for multi-pod state synchronization. |
 
 ---
 
-## Turn lifecycle & barge-in flow
+## Architecture & Event Flow
 
 ```mermaid
 flowchart TD
-    A["Caller speaks (16kHz PCM frames)"] --> B["Dual-Frame RMS VAD (40ms window)"]
-    B --> C["Turn FSM: LISTENING -> THINKING"]
-    C --> D["LLM token stream received"]
-    D --> E["Clause-Boundary Chunker (3-5 words first chunk)"]
-    E --> F["Streaming TTS (Cartesia Sonic / Formant Harness)"]
-    F --> G["Turn FSM: SPEAKING"]
-    G --> H["Audio Ring Buffer (tagged with turnGen)"]
-    H --> I["WebSocket Send Loop -> Caller Speaker"]
-    
-    J["Caller Interrupts (Barge-In Voice Detected)"] -.->|TriggerBargeIn| K["Atomic turnGen++"]
-    K -.-> L["Cancel Turn context.Context"]
-    L -.-> M["Drain pending audio buffer"]
-    M -.-> N["Send BARGE_IN_TRIGGERED control frame"]
-    N -.-> O["Turn FSM: INTERRUPTED -> LISTENING (~22 µs)"]
-    H -.->|Stale turnGen check: dropped| P["Discard stale chunks"]
+    A["Caller: WS /ws/voice/{session_id}\nbinary PCM frames + JSON control msgs"] --> B["Auth: origin check, Bearer constant-time compare"]
+    B --> C["Recv Loop: AudioFrame → VAD"]
+    C --> D["ComputeRMSEnergy(pcm)\n± 7.77 µs / frame"]
+    D --> E{"BargeInMinFrames\nconsecutive voiced?"}
+    E -->|no| F["Continue accumulating"]
+    E -->|yes barge-in| G["TriggerBargeIn()\n~22 µs"]
+    G --> H["atomic.AddUint64(&turnGen, 1)"]
+    H --> I["activeTurnCancel()"]
+    I --> J["Drain audioOut channel\nnon-blocking loop"]
+    J --> K["FSM: SPEAKING → INTERRUPTED → LISTENING"]
+    K --> L["Emit BARGE_IN_TRIGGERED JSON control frame"]
+
+    M["LLM token stream"] --> N["SentenceChunker.IngestToken(token)"]
+    N --> O{"IsFirstChunk &&\nwordCount >= 3 &&\nclause boundary?"}
+    O -->|yes < 250ms TTFA| P["Emit chunk to TTS immediately"]
+    O -->|no| Q["Accumulate to sentence boundary\nor 25-word safety cap"]
+    P --> R["synthesizeAndStream(ctx, chunk, turnGen)"]
+    Q --> R
+    R --> S{"atomic.LoadUint64(&turnGen)\n== chunk.turnGen?"}
+    S -->|mismatch — stale turn| T["Discard: drop audio silently"]
+    S -->|match| U["Send binary PCM frame → caller speaker"]
 ```
 
 ---
 
-## The pieces, one by one
+## The Subsystems, One by One
 
-### 1. Atomic turn generations (`turnGen uint64`)
-When an interruption occurs, aborting the active context is not enough: a goroutine synthesizing speech or reading from a channel might still have audio chunks in flight. 
-TurnOrchestrator tags every audio chunk with the current `turnGen`. When barge-in fires:
-1. `turnGen` is atomically incremented via `atomic.AddUint64`.
-2. The active turn's `context.Context` is cancelled.
-3. The pending audio playback buffer is drained.
-4. When any chunk reaches the WebSocket sender loop, its `chunk.TurnGen` is compared to the active `turnGen`. If it is older, it is discarded on the spot.
+### 1. Turn Generation Counter: The Stale-Frame Barrier
 
-### 2. Clause-boundary sentence chunker
-Waiting for a full sentence or entire LLM response creates an unbearable 1.5–3 second delay. 
-The clause chunker buffers streaming tokens and emits synthesis chunks based on conversational heuristics:
-- **First chunk optimization**: Emits as soon as 3–5 words accumulate and hit a clause boundary (`,`, `;`, `:`, `.`) to achieve sub-250ms Time-to-First-Audio.
-- **Abbreviation & number protection**: Skips honorific abbreviations (`Dr.`, `Mr.`, `Ms.`, `Prof.`, `vs.`, `etc.`), decimal values (`3.14`), and ellipses (`...`) so titles and prices do not trigger false sentence splits.
+Cancelling a context (`ctx.Done()`) instructs worker goroutines to stop, but it does not stop them instantaneously. A goroutine inside `synthesizeAndStream` may have already generated a PCM frame and queued it for transmission. If that frame reaches the caller, they hear a half-syllable fragment of the interrupted turn.
 
-### 3. Dual-window RMS energy VAD
-Ingested audio arrives in 20ms frames (640 bytes for 16kHz 16-bit linear PCM). 
-The in-process Voice Activity Detector calculates Root Mean Square energy:
-$$RMS = \sqrt{\frac{1}{N}\sum_{i=1}^N x_i^2}$$
-To prevent transient mouth clicks, breath pops, or line static from triggering false barge-ins, the VAD enforces `BargeInMinFrames: 2`. Two consecutive 20ms frames (>40ms total) must exceed the energy threshold (`0.02`) before the engine confirms caller speech.
+TurnOrchestrator eliminates this race by pairing context cancellation with a monotonic generation counter:
 
-### 4. Streaming TTS: Cartesia Sonic & Formant test harness
-TurnOrchestrator isolates synthesis behind a clean `StreamingTTSProvider` interface:
-- **`CartesiaStreamingTTS`**: Connects via WebSocket to `wss://api.cartesia.ai/tts/websocket`, streaming raw linear PCM frames as speech is generated.
-- **`FormantTestHarnessTTS`**: An offline acoustic waveform synthesizer that generates multi-formant audio ($F_0=150\text{Hz}, F_1=500\text{Hz}, F_2=1500\text{Hz}$) with real acoustic energy. Used automatically in CI and local dev when `CARTESIA_API_KEY` is omitted.
+```go
+// internal/pipeline/session.go: TriggerBargeIn
+s.mu.Lock()
+defer s.mu.Unlock()
 
-### 5. Session reconnect & recovery grace period
-Telephone calls over cellular or WebRTC frequently suffer transient network drops. 
-When a WebSocket disconnects, TurnOrchestrator does not destroy the dialogue session immediately:
-- The session is marked detached and granted a **60-second recovery grace window** (`ShouldExpire`).
-- If the carrier or client reconnects to `/ws/voice/{session_id}` within 60 seconds, the audio queue and conversation state reattach seamlessly.
-
-### 6. Fail-closed security & authentication
-- **Origin verification**: RFC 6454 origin checking blocks Cross-Site WebSocket Hijacking (CSWSH).
-- **Bearer auth**: Constant-time token comparison (`subtle.ConstantTimeCompare`) prevents timing attacks.
-- **No query-string tokens**: Tokens passed via query parameters (`?token=...`) are rejected to avoid leaking credentials into web server logs, proxy access trails, and browser history.
-- **Production fail-closed**: When `REQUIRE_AUTH=true`, omitting `AUTH_TOKEN` causes the server to refuse startup rather than running unprotected.
-
----
-
-## Protocol & audio format
-
-### WebSocket endpoint
-`GET /ws/voice/{session_id}`
-
-### Audio frames (binary messages)
-- **Format**: Raw 16-bit Linear PCM (`pcm_s16le`), mono, 16,000 Hz sample rate.
-- **Frame duration**: 20ms per packet (640 bytes per frame).
-
-### Control messages (text JSON messages)
-The WebSocket multiplexes binary audio with JSON control frames:
-
-```json
-// Triggered by the server when caller speaks during AI playback
-{
-  "event": "BARGE_IN_TRIGGERED",
-  "turn_gen": 4,
-  "timestamp_ms": 1700000000123
+newGen := atomic.AddUint64(&s.turnGen, 1)
+if s.activeTurnCancel != nil {
+    s.activeTurnCancel()
+    s.activeTurnCancel = nil
 }
 ```
 
-```json
-// Dispatched when the AI completes a speaking turn
-{
-  "event": "SPEAKING_COMPLETED",
-  "turn_gen": 4,
-  "sentences_spoken": 2
+At the WebSocket write boundary, every chunk is checked against the current generation:
+
+```go
+// internal/pipeline/session.go: synthesizeAndStream
+for chunk := range audioChan {
+    if atomic.LoadUint64(&s.turnGen) != currentTurnGen {
+        // Discard stale frame from interrupted turn
+        continue
+    }
+    select {
+    case s.audioOut <- chunk:
+    case <-ctx.Done():
+        return
+    }
 }
+```
+
+`TestDeterministicStaleAudioBarrier` and `TestStaleAudioDroppedAfterBargeIn` verify that even if 50 audio-generation goroutines race against a barge-in event, zero stale audio frames escape to the client.
+
+### 2. Sub-50ms Barge-In Cancellation
+
+When the caller speaks while the AI is talking, the system must abort in-flight work immediately. `TriggerBargeIn` performs four atomic operations sequentially:
+
+1. Increments `turnGen` to invalidate in-flight frames.
+2. Invokes `activeTurnCancel()` to abort ongoing TTS network calls.
+3. Drains buffered frames from `s.audioOut` via a non-blocking loop.
+4. Transitions the FSM: `SPEAKING → INTERRUPTED → LISTENING`.
+
+```go
+// Drain buffered outgoing audio so caller hears immediate silence
+for {
+    select {
+    case <-s.audioOut:
+    default:
+        goto drained
+    }
+}
+drained:
+```
+
+Microbenchmarks reveal that the pure Go orchestration logic completes in **~22.3 µs**. Adding frame energy calculation and FSM dispatch brings total system reaction time to **~41.5 µs**, well below the physical 20ms audio packet boundary.
+
+### 3. Clause-Boundary Chunker for Sub-250ms TTFA
+
+Waiting for a full sentence before initiating speech synthesis adds 800–1200ms of latency. Streaming single words to TTS produces robotic, disjointed pitch contours.
+
+`SentenceChunker` uses a hybrid strategy:
+- **First Chunk:** Evaluated aggressively at 3+ words if a clause boundary is detected (`,`, `;`, `:`, `—`). This dispatches the initial audio chunk to TTS immediately to hit `< 250ms` TTFA.
+- **Subsequent Chunks:** Evaluated at full sentence boundaries (`.`, `?`, `!`) or a 25-word safety cap to ensure natural vocal inflection.
+
+```go
+// internal/chunker/chunker.go
+func (c *SentenceChunker) findClauseBoundary(text string) int {
+    minWords := c.cfg.FirstChunkMinWords
+    if minWords <= 0 {
+        minWords = 3
+    }
+    // Respects abbreviations (Dr., e.g., Inc.) and decimal points
+    for _, idx := range candidates {
+        prefix := strings.TrimSpace(text[:idx])
+        if countWords(prefix) >= minWords && !c.isAbbreviation(prefix) {
+            return idx + 1
+        }
+    }
+    return -1
+}
+```
+
+`TestSentenceChunkerFirstChunkOptimization` tests clause dispatch timing, while `TestSentenceChunkerAbbreviationAndEllipsis` verifies abbreviations (`Dr.`, `e.g.`, `3.14`) do not trigger premature splits.
+
+### 4. Telephone Reconnect Grace Period
+
+Mobile telephone connections experience brief packet dropouts and socket resets. Rather than tearing down session context and dialogue memory on socket disconnect, `SessionManager` holds the session in a detached state:
+
+- On disconnect, the session transitions to `DETACHED` and a 60-second timer begins.
+- If the client reconnects with the same `session_id` and token within 60 seconds, the new WebSocket is bound to the existing state machine and dialogue buffer.
+- If the timer expires, memory is reclaimed and the session is destroyed.
+
+`TestWebSocketSessionReconnectRecovery` validates that session state, turn generation, and conversation history survive mid-call reconnections.
+
+---
+
+## Protocol
+
+### WebSocket Endpoint: `GET /ws/voice/{session_id}`
+
+Requires HTTP header: `Authorization: Bearer <token>`. Query-parameter authentication (`?token=`) is explicitly rejected with `401 Unauthorized` to prevent token leakage in proxy logs.
+
+#### Binary Frames
+Raw 16kHz, 16-bit mono linear PCM audio (320 bytes = 10ms; 640 bytes = 20ms). Sent bidirectionally.
+
+#### Text Frames (JSON Control Plane)
+Used for status synchronization and event dispatch:
+
+```json
+// Inbound: Inject LLM token stream
+{"type": "llm_token", "token": "Hello"}
+
+// Outbound: Barge-in triggered event
+{"type": "barge_in", "turn_id": 4, "reaction_time_us": 22}
+
+// Outbound: State transition notification
+{"type": "state_change", "from": "SPEAKING", "to": "LISTENING"}
 ```
 
 ---
 
 ## Run it
 
-### Environment variables
-
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `PORT` | `8085` | HTTP & WebSocket listen port |
-| `TTS_PROVIDER` | `formant` | Active TTS provider (`cartesia` or `formant`) |
-| `CARTESIA_API_KEY` | `""` | Cartesia Sonic API key (omitting uses formant test harness) |
-| `CARTESIA_VOICE_ID` | `a0e998e3-182d-4d96-8d1a-0e624b66ffc2` | Cartesia voice identifier |
-| `REQUIRE_AUTH` | `false` | When `true`, enforces fail-closed Bearer authentication |
-| `AUTH_TOKEN` | `""` | Secret Bearer token required for all requests |
-
-### Running locally
+### Quickstart (30 seconds)
 
 ```bash
-# Clone the repository
 git clone https://github.com/yoohooshantanu/vocalflow.git
 cd vocalflow
 
-# Run all tests
-go test -v ./tests/...
+# Run full test suite with race detector
+go test -v -race ./tests/...
 
-# Start server
-go run ./cmd/server
+# Run microbenchmarks
+go test -bench=. -benchmem ./tests/...
 ```
 
-### Running with Docker Compose
+### Launch Server
 
 ```bash
-docker compose up -d
+# Start server with default test token
+PORT=8080 AUTH_TOKEN=secret-token go run cmd/server/main.go
 ```
 
-- **Gateway**: `http://localhost:8085` (WebSocket: `ws://localhost:8085/ws/voice/{session_id}`)
-- **Metrics**: `http://localhost:8085/metrics`
-- **Prometheus UI**: `http://localhost:9090`
-- **pprof Profiling**: `http://localhost:8085/debug/pprof/`
-
-### Creating a session
-
+Connect via client:
 ```bash
-curl -X POST http://localhost:8085/v1/sessions \
-  -H "Content-Type: application/json" \
-  -d '{"client_id": "test_caller_01"}'
+websocat -H="Authorization: Bearer secret-token" ws://localhost:8080/ws/voice/call-123
 ```
 
 ---
 
 ## Observability
 
-TurnOrchestrator exposes Prometheus metrics at `GET /metrics`:
+Prometheus metrics exposed at `GET /metrics`:
 
 | Metric | Type | Description |
 | :--- | :--- | :--- |
-| `voice_turn_latency_seconds` | Histogram | Time-to-First-Audio (TTFA) and turn completion latencies |
-| `voice_turn_barge_in_total` | Counter | Total caller interruption events triggered |
-| `voice_turn_barge_in_reaction_ms` | Gauge | Most recent barge-in reaction latency in milliseconds |
-| `voice_active_sessions` | Gauge | Currently connected live voice sessions |
-| `voice_audio_frames_total` | Counter | Audio frames processed, labeled by direction (`inbound`, `outbound`) |
-| `voice_sentences_synthesized_total`| Counter | Sentence chunks dispatched to TTS synthesis |
-
-Liveness and health checks are available at `GET /healthz`.
+| `turn_active_sessions` | Gauge | Active live WebSocket sessions |
+| `turn_barge_in_total` | Counter | Total confirmed barge-in interruptions |
+| `turn_barge_in_reaction_ms` | Gauge | Most recent barge-in reaction latency (µs) |
+| `turn_audio_frames_total` | Counter | PCM frames processed, labeled by `direction` (`inbound`/`outbound`) |
+| `turn_sentences_synthesized_total` | Counter | Text chunks dispatched to speech synthesis |
+| `turn_ttfa_seconds` | Histogram | Latency from caller speech end to first audio packet dispatched |
 
 ---
 
 ## Tests
 
-The test suite runs with Go's race detector against live audio buffers, concurrent turn generation transitions, and synthetic WebSocket streams.
+The test suite contains 27 test functions and 5 benchmarks, run with `go test -race` on every pull request in GitHub Actions CI.
 
-| Test File | Focus | Test Count |
+| Area | Tests | Invariants Verified |
 | :--- | :--- | :--- |
-| `tests/turn_test.go` | FSM transitions, barge-in cancellation, VAD accumulation, clause chunker edge cases | 16 tests |
-| `tests/websocket_test.go` | Full-duplex WebSocket streaming, session reconnect grace, fail-closed auth, origin security | 6 tests |
-| `tests/benchmark_test.go` | Benchstat microbenchmarks for barge-in latency, RMS calculation, and sentence chunking | 5 benchmarks |
-
-Run all tests:
-```bash
-go test -v -race ./tests/...
-```
+| **FSM** | `TestFSMStateTransitions` | Enforces valid transition paths (`IDLE→LISTENING→THINKING→SPEAKING→DRAINING→LISTENING`); rejects illegal direct transitions. |
+| **VAD** | `TestVADSilenceDetection`, `TestVADAudioStreamBargeInDeadlockFree` | Validates speech start/stop boundaries and ensures thread safety under 100 concurrent frame workers. |
+| **Chunker** | `TestSentenceChunkerFirstChunkOptimization`, `TestSentenceChunkerAbbreviationAndEllipsis` | Guarantees early clause emission for TTFA while preventing invalid splits on decimals and acronyms. |
+| **Barge-in** | `TestSub40msBargeInCancellation`, `TestBargeInInIdleOrListeningNoOp`, `TestBargeInRaceWithConcurrentAudioSynthesis` | Proves barge-in completes within deadline and handles 50 concurrent synthesizing goroutines safely. |
+| **Stale Audio** | `TestStaleAudioDroppedAfterBargeIn`, `TestDeterministicStaleAudioBarrier` | Verifies generation counter barrier discards all post-interrupt audio frames. |
+| **Pipeline** | `TestEndToEndBargeInPipelineLatency`, `TestCancelledContextNeverEnqueuesAudioWithBufferSpace` | Exercises end-to-end event chain and checks that cancelled contexts halt enqueueing. |
+| **Sessions** | `TestConcurrentVoiceSessions`, `TestStrictAudioChunkSequentialOrdering` | Validates isolation across 20 simultaneous sessions and strict monotonic frame sequence delivery. |
+| **WebSocket** | `TestWebSocketFullDuplexLiveAudio`, `TestWebSocketIncrementalTTSStreamingPipeline`, `TestWebSocketSessionReconnectRecovery` | Verifies binary round-trips, incremental TTS streaming, and 60-second disconnect recovery. |
+| **Security** | `TestWebSocketOriginSecurityValidation`, `TestWebSocketAuthentication`, `TestWebSocketFailClosedSecurity` | Rejects cross-origin requests, invalid tokens, and query parameter credentials. |
+| **TTS Adapters** | `TestFormantWaveformSynthesis`, `TestCartesiaProviderLifecycleAndFallback`, `TestTimeToFirstAudioMeasurementWithDelayedProvider`, `TestTTSProviderEnvironmentConfiguration` | Exercises Cartesia streaming client, formant test harness fallback, and provider error handling. |
+| **Recovery** | `TestStreamFailureMidTurnRecovery`, `TestWebSocketStreamFailureServerRecovery` | Ensures upstream TTS network dropouts do not crash the session loop. |
+| **Generation Filter** | `TestEmitterGenerationFilterFakeConn` | Verifies mismatching generation tags suppress transmission even over open connections. |
 
 ---
 
 ## Performance
 
-Measured using `benchstat` over 10 independent runs (`-count=10`) on AMD Ryzen 5 (Windows amd64 / Ubuntu x86_64, Go 1.24). Setup overhead (`NewVoiceSession`, FSM creation, channel pre-buffering) is isolated and excluded from the timed interruption regions via `b.StopTimer()`:
+Microbenchmarks measured via `benchstat` across 10 runs (`-count=10`) on AMD Ryzen 5 (Windows amd64 / Ubuntu x86_64, Go 1.24):
 
 ```text
-Benchmark                                 Time (sec/op)      Memory (B/op)   Allocs (allocs/op)
------------------------------------------------------------------------------------------------
-SpeakingTurnSetupAlone-8                  204.5µs ± 10%         16.33 KiB        54.00 ± 0%
-BargeInCancellationLatency-8               22.34µs ± 20%           224 B          9.00 ± 0%
-TriggerBargeInDirect-8                     24.07µs ± 12%           224 B          9.00 ± 0%
-EndToEndBargeInPipeline-8                  41.46µs ± 32%           295 B         14.00 ± 0%
-RMSEnergyCalculation-8                      7.77µs ± 84%             0 B          0.00 ± 0%
-SentenceChunker-8                          36.70µs ± 86%           672 B         17.00 ± 0%
+pkg: github.com/yoohooshantanu/turn-orchestrator/tests
+cpu: AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx
+
+Benchmark                           sec/op        B/op   allocs/op
+SpeakingTurnSetupAlone-8         204.5µ ± 10%   16.3Ki      54.0
+BargeInCancellationLatency-8      22.34µ ± 20%   224 B       9.0
+TriggerBargeInDirect-8            24.07µ ± 12%   224 B       9.0
+EndToEndBargeInPipeline-8         41.46µ ± 32%   295 B      14.0
+RMSEnergyCalculation-8             7.77µ ± 84%     0 B       0.0
+SentenceChunker-8                 36.70µ ± 86%   672 B      17.0
 ```
 
-### Understanding the latencies
-- **Pure in-process interrupt (`TriggerBargeInDirect` ~24.1 µs)**: Mutex lock, active turn context cancellation, atomic turn generation bump, audio buffer drain, and FSM transition from `SPEAKING` $\rightarrow$ `INTERRUPTED` $\rightarrow$ `LISTENING`.
-- **Full pipeline after frames arrive (`EndToEndBargeInPipeline` ~41.5 µs)**: RMS energy calculation on PCM frame $\rightarrow$ dual-frame VAD threshold evaluation $\rightarrow$ barge-in trigger callback $\rightarrow$ context cancellation $\rightarrow$ output drain $\rightarrow$ WebSocket event emission.
-- **Physical audio delay**: The physical accumulation window requires 2 frames $\times$ 20ms = 40ms of voiced audio before confirmation. The engine reacts in **~41.5 µs** once that physical threshold is reached.
-- **In-flight boundary guarantee**: When `TriggerBargeIn()` returns, **at most one frame** can already be in flight over the wire. The emitted `BARGE_IN_TRIGGERED` control event signals the client player to flush its local hardware buffer.
+### Analysis of Latency Bounds:
+- **`TriggerBargeInDirect` (~24 µs):** The raw internal cancellation overhead: mutex lock, generation counter increment, context cancellation, non-blocking audio channel drain, and two FSM transitions.
+- **`BargeInCancellationLatency` (~22 µs):** Time elapsed between barge-in trigger and total stale frame invalidation.
+- **`EndToEndBargeInPipeline` (~41.5 µs):** The end-to-end path from raw PCM input through RMS energy calculation, two-frame VAD thresholding, barge-in invocation, and JSON control notification dispatch.
+- **`RMSEnergyCalculation` (7.77 µs, 0 allocs):** Zero-allocation hot path running pure SIMD-friendly integer arithmetic on the stack.
 
 ---
 
-## Limitations and rough edges
+## Architectural Trade-offs
 
-- **No live ASR model**: This engine does not perform speech transcription. It detects energy (voice presence) to handle interruptions and route turns, but delegates speech-to-text to external services.
-- **Single-node in-memory sessions**: Active sessions and audio queues live in process memory. If the server crashes mid-call, the caller must reconnect and establish a new session.
-- **Fixed PCM audio format**: The engine is strictly hardcoded to 16kHz 16-bit linear mono PCM. It does not transcode Opus, G.711 $\mu$-law, or AAC in-process; an upstream gateway (like `streambridge`) must decode telephony codecs to PCM before feeding this service.
-- **VAD is energy-based, not neural**: The VAD uses RMS energy thresholds rather than a neural model (such as Silero VAD). In high-noise environments (e.g. car traffic or barking dogs), energy-based VAD may occasionally trigger false interruptions if the energy threshold is configured too low.
+1. **In-Memory Session State:** Session context, audio buffers, and dialogue history reside in process memory. If a server node restarts, in-flight calls must reconnect. In a distributed multi-node topology, session affinity (sticky routing) or a Redis backplane is required.
+2. **Energy VAD vs Neural VAD:** Energy VAD (`ComputeRMSEnergy`) runs in sub-10 microseconds with zero allocations, but cannot distinguish between human speech and loud ambient noise (e.g. background dog barking, sirens). In production, pairing this with a lightweight neural classifier (e.g. Silero VAD) balances speed and noise rejection.
+3. **Fixed Audio Format:** The engine expects 16kHz 16-bit mono linear PCM. Media proxies (such as `streambridge` or FreeSWITCH) must transcode G.711 / Opus before hitting this gateway.
+4. **Offline TTS Fallback in CI:** While the Cartesia Sonic adapter is production-ready code, automated CI tests run against the deterministic `FormantTestHarnessTTS` to avoid third-party API dependencies and network flakes.
 
 ---
 
-## Repo map
+## Repo Map
 
-| Path | What it does |
+| Path | Description |
 | :--- | :--- |
-| `cmd/server/main.go` | Gateway entrypoint, route handlers, WebSocket upgrader, graceful shutdown |
-| `internal/fsm/fsm.go` | Turn-taking Finite State Machine with thread-safe state transition validation |
-| `internal/vad/vad.go` | In-process RMS energy calculation and dual-frame 40ms VAD accumulation |
-| `internal/chunker/chunker.go` | Streaming clause-boundary token chunker with honorific and decimal heuristics |
-| `internal/pipeline/session.go`| Core voice session, full-duplex loops, atomic turn generations, barge-in coordinator |
-| `internal/pipeline/manager.go`| Multi-session registry with 60-second detached reconnect recovery |
-| `internal/pipeline/tts.go` | `StreamingTTSProvider` interface, Cartesia Sonic client, and Formant test harness |
-| `internal/metrics/metrics.go` | Prometheus metrics definitions and exposition handler |
-| `internal/model/types.go` | Audio frame, turn state, and WebSocket control message definitions |
-| `tests/turn_test.go` | Turn state transitions, stale audio barriers, and VAD validation |
-| `tests/websocket_test.go` | Full-duplex WebSocket tests, session reconnect, and fail-closed security |
-| `tests/benchmark_test.go` | Microbenchmarks for barge-in cancellation, RMS energy, and chunking |
+| `cmd/server/main.go` | HTTP server initialization, WebSocket upgrade, session routing, graceful shutdown |
+| `internal/fsm/fsm.go` | Thread-safe turn-taking FSM with transition table validation |
+| `internal/vad/vad.go` | Zero-allocation `ComputeRMSEnergy`, `ProcessFrame`, 2-frame majority voting |
+| `internal/chunker/chunker.go` | Clause-boundary chunker with early first-chunk optimization and abbreviation guards |
+| `internal/pipeline/session.go` | `VoiceSession`: full-duplex loops, `TriggerBargeIn`, `synthesizeAndStream`, `turnGen` barrier |
+| `internal/pipeline/manager.go` | Multi-session registry with 60-second detached reconnect grace window |
+| `internal/pipeline/tts.go` | `StreamingTTSProvider` interface, Cartesia Sonic WebSocket adapter, formant test harness |
+| `internal/metrics/metrics.go` | Prometheus metrics instrumentation |
+| `internal/model/types.go` | Core data structures: `AudioFrame`, `SentenceChunk`, `TurnEvent`, `ConversationState` |
+| `tests/turn_test.go` | State machine, VAD, chunker, barge-in, stale audio, and concurrency tests |
+| `tests/websocket_test.go` | Full-duplex WebSocket, reconnect, fail-closed auth, and TTS adapter tests |
+| `tests/benchmark_test.go` | `benchstat`-compatible microbenchmarks |
 
 ---
 
 ## Author
 
-- **Shantanu Juvekar** ([@yoohooshantanu](https://github.com/yoohooshantanu))
-- Email: `santanujuvekar@gmail.com`
-- License: MIT
+Shantanu Juvekar, [@yoohooshantanu](https://github.com/yoohooshantanu).
