@@ -1,13 +1,13 @@
 # TurnOrchestrator
 
-[![CI](https://github.com/yoohooshantanu/vocalflow/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/vocalflow/actions/workflows/ci.yml)
+[![CI](https://github.com/yoohooshantanu/turn-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/turn-orchestrator/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8)
 ![WebSocket](https://img.shields.io/badge/WebSocket-Full--Duplex-010101)
 ![Audio](https://img.shields.io/badge/Audio-16kHz%20Linear%20PCM-blueviolet)
 
 A real-time, full-duplex conversational turn orchestrator written in Go. It manages the conversational loop between a caller and voice AI: streaming 16kHz PCM audio over WebSockets in both directions, detecting caller speech via energy-based VAD, cancelling in-flight AI speech in ~22 µs on caller barge-in, and chunking streaming LLM tokens at clause boundaries.
 
-*(The GitHub repo is called vocalflow. The Go module and binary are named turn-orchestrator from an architectural rename.)*
+
 
 ### Key Technical Highlights
 - **Sub-50µs Interruption Reaction:** Cancels active speech synthesis, drains audio queues, and transitions the conversation FSM in ~22 µs upon user barge-in.
@@ -249,8 +249,8 @@ Requires HTTP header: `Authorization: Bearer <token>`. Query-string authenticati
 ### Quickstart (30 seconds)
 
 ```bash
-git clone https://github.com/yoohooshantanu/vocalflow.git
-cd vocalflow
+git clone https://github.com/yoohooshantanu/turn-orchestrator.git
+cd turn-orchestrator
 
 # Run all tests with race detector
 go test -v -race ./tests/...
